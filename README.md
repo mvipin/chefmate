@@ -21,12 +21,43 @@
   - [Software Stack](#software-stack)
 
 - **[2. GR00T N1.5 Transformer Architecture](#2-groot-n15-transformer-architecture)**
-  - [Dual-System Architecture](#dual-system-architecture)
-  - [Eagle VLM Backbone](#eagle-vlm-backbone)
-  - [Diffusion Transformer Action Head](#diffusion-transformer-action-head)
-  - [State & Action Encoders](#state--action-encoders)
+  - [Eagle25VL Vision-Language Model Architecture](#eagle25vl-vlm-architecture)
+  - [LoRA Adapter](#lora-adapter)
+  - [Fine-Tunable Parameters](#fine-tunable-parameters)
+  - [Pixel Shuffle Operation](#pixel-shuffle-operation)
+  - [State Encoder](#state-encoder)
+  - [Action Encoder](#action-encoder)
+  - [Action Decoder](#action-decoder)
+  - [Diffusion Transformer (DiT) Architecture](#dit-architecture)
 
-- **[3. Fine-Tuning GR00T N1.5](#3-fine-tuning-groot-n15)**
+- **[3. Preprocessing Pipeline](#3-preprocessing-pipeline)**
+  - [Input Packing (GrootPackInputsStep)](#input-packing-grootpackinputsstep)
+  - [Vision-Language Encoding (GrootEagleEncodeStep)](#vision-language-encoding-grooteagleencodestep)
+  - [Tokenization and Batching (GrootEagleCollateStep)](#tokenization-and-batching-grooteaglecollatestep)
+
+- **[4. Eagle VLM Backbone](#4-eagle-vlm-backbone)**
+  - [Eagle25VLForConditionalGeneration.forward() Deep Dive](#eagle-forward-method)
+  - [VLM as Feature Extractor (No Labels During Robotic Training)](#vlm-as-feature-extractor)
+  - [Post-VLM Processing: Dimension Projection](#post-vlm-processing)
+
+- **[5. Action Head Processing](#5-action-head-processing)**
+  - [VL Feature Refinement: vlln and vl_self_attention](#vl-feature-refinement)
+  - [State Encoding](#state-encoding)
+  - [Action Encoding: Training vs Inference](#action-encoding-training-vs-inference)
+  - [Future Tokens and Sequence Construction](#sequence-construction)
+  - [Training Data Flow and Flow Matching](#training-data-flow)
+
+- **[6. Diffusion Transformer (DiT)](#6-diffusion-transformer-dit)**
+  - [Timestep Encoding](#timestep-encoding)
+  - [Transformer Blocks (×12)](#transformer-blocks-12)
+  - [Output Projection](#output-projection)
+
+- **[7. Action Decoding](#7-action-decoding)**
+  - [Action Decoder Projection](#action-decoder-projection)
+  - [Loss Computation (Training)](#loss-computation-training)
+  - [Euler Integration (Inference)](#euler-integration-inference)
+
+- **[8. Fine-Tuning GR00T N1.5](#8-fine-tuning-groot-n15)**
   - [Workflow Overview](#workflow-overview)
   - [Step 0: Calibration](#step-0-calibration)
   - [Step 1: Data Collection](#step-1-data-collection)
@@ -35,7 +66,7 @@
   - [Step 4: Inference Server](#step-4-inference-server)
   - [Step 5: Robot Deployment](#step-5-robot-deployment)
 
-- **[4. Simulation & Data Pipeline](#4-simulation--data-pipeline)**
+- **[9. Simulation & Data Pipeline](#9-simulation--data-pipeline)**
   - [USD Scene Design](#usd-scene-design)
   - [Isaac Sim Environment](#isaac-sim-environment)
   - [Workflow Overview](#simulation-workflow-overview)
@@ -48,23 +79,23 @@
   - [Dual-Camera System](#dual-camera-system)
   - [Sim-to-Real Transfer](#sim-to-real-transfer)
 
-- **[5. Performance Analysis](#5-performance-analysis)**
+- **[10. Performance Analysis](#10-performance-analysis)**
   - [Training Performance](#training-performance)
   - [Inference Performance](#inference-performance)
 
-- **[6. Getting Started](#6-getting-started)**
+- **[11. Getting Started](#11-getting-started)**
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
   - [Running Demonstrations](#running-demonstrations)
 
-- **[7. Troubleshooting](#7-troubleshooting)**
+- **[12. Troubleshooting](#12-troubleshooting)**
   - [Camera & Vision Issues](#camera--vision-issues)
   - [Training Issues](#training-issues)
   - [Deployment Issues](#deployment-issues)
   - [Simulation Issues](#simulation-issues)
   - [MimicGen Issues](#mimicgen-issues)
 
-- **[8. Future Work](#8-future-work)**
+- **[13. Future Work](#13-future-work)**
 
 ---
 
@@ -337,190 +368,4150 @@ flowchart TB
 <a id="2-groot-n15-transformer-architecture"></a>
 ## 2. GR00T N1.5 Transformer Architecture
 
-GR00T N1.5 is a 3B parameter Vision-Language-Action (VLA) model. For the complete white paper to implementation correlation, see [docs/architecture/groot_whitepaper_implementation_correlation.md](docs/architecture/groot_whitepaper_implementation_correlation.md).
+![GR00T N1.5 Vision-Language-Action Transformer Architecture](assets/images/architecture.svg)
 
-<a id="dual-system-architecture"></a>
-### Dual-System Architecture
+GR00T N1.5 is a 3-billion parameter Vision-Language-Action (VLA) model designed for robotic manipulation. The architecture follows a dual-system design: a **vision-language backbone** (System 2) for scene understanding and a **diffusion transformer action head** (System 1) for motor control. This separation allows the VLM to run at ~10 Hz for reasoning while the action head generates fluid motions at ~120 Hz.
 
-GR00T N1.5 uses a dual-system design inspired by human cognitive processing:
+The data flow begins with camera observations and language instructions entering the **Eagle VLM backbone**. Images are processed by a **SigLIP-2 vision encoder** (ViT-L/14) that produces 256 patch embeddings per frame. These vision tokens pass through an **MLP connector** that projects them from the vision encoder's 1152-dimensional space to the language model's 2048-dimensional space. The **Qwen3 language model** (using only the first 12 of its 28 layers) jointly processes the vision tokens and tokenized language instructions through self-attention. The resulting multimodal embeddings capture both visual scene understanding and task semantics.
 
-> "GR00T N1 is a Vision-Language-Action (VLA) model that adopts a dual-system design... The vision-language module (System 2) interprets the environment through vision and language instructions. The subsequent diffusion transformer module (System 1) generates fluid motor actions in real time."
-> — *GR00T N1.5 White Paper, Section 2.1*
+The backbone output is projected from 2048 to 1536 dimensions via **eagle_linear** before entering the **Diffusion Transformer (DiT) action head**. The DiT uses **flow matching** with 4 Euler integration steps to denoise random noise into a 16-step action trajectory. Each DiT block alternates between cross-attention (attending to VLM features) and self-attention (refining action predictions), conditioned on the denoising timestep via **adaptive layer normalization**. Robot state information is encoded through **embodiment-specific MLPs** that map varying joint configurations to a shared embedding space. The final action predictions are decoded back to the robot's action dimension (e.g., 7 DoF for SO-100: 6 joint positions + 1 gripper).
 
-| System | Component | Function | Rate | Implementation |
-|--------|-----------|----------|------|----------------|
-| **System 2** | Eagle-2 VLM | Vision-language reasoning | ~10 Hz | `gr00t/model/backbone/eagle_backbone.py` |
-| **System 1** | DiT Action Head | Fluid motor action generation | ~120 Hz | `gr00t/model/action_head/flow_matching_action_head.py` |
+For the complete white paper to implementation correlation, see [docs/architecture/groot_whitepaper_implementation_correlation.md](docs/architecture/groot_whitepaper_implementation_correlation.md).
 
-**Data Flow:**
-```
-Observations → EagleBackbone (VLM) → backbone_features → FlowmatchingActionHead (DiT) → Actions
-                    ↑                                              ↑
-              System 2 (10Hz)                               System 1 (120Hz)
-```
+<a id="eagle25vl-vlm-architecture"></a>
+### Eagle25VL Vision-Language Model Architecture
 
-**Core Model Structure** (`gr00t/model/gr00t_n1.py`):
+The Eagle VLM backbone is implemented as `Eagle25VLForConditionalGeneration`, a HuggingFace-compatible Vision-Language Model combining a SigLIP-2 vision encoder with a Qwen3 language model. This section documents the model architecture as instantiated in the `__init__` method.
+
+#### Major Components
+
+| Component | Class | Variable Name | Purpose |
+|-----------|-------|---------------|---------|
+| **Vision Encoder** | `SiglipVisionModel` | `self.vision_model` | Encodes input images into visual feature embeddings via Vision Transformer |
+| **Language Model** | `Qwen3ForCausalLM` | `self.language_model` | Processes multimodal tokens (text + vision) autoregressively |
+| **MLP Connector** | `nn.Sequential` | `self.mlp1` | Projects vision features (1152-dim) to match LLM embedding dimension (2048-dim) |
+| **LoRA Adapters** | PEFT wrappers | via `wrap_backbone_lora`, `wrap_llm_lora` | Optional parameter-efficient fine-tuning |
+
+#### Vision Encoder: SiglipVisionModel
+
+The SigLIP-2 Vision Transformer encodes images into patch embeddings:
+
+- **Input**: `pixel_values` tensor of shape `[B, C, H, W]`
+- **Output**: Sequence of patch embeddings `[B, num_patches, hidden_size]`
+- **Architecture**: Vision Transformer (ViT) splitting images into 14×14 patches
+
 ```python
-class GR00T_N1_5(PreTrainedModel):
-    def __init__(self, config: GR00T_N1_5_Config, local_model_path: str):
-        # System 2: Vision-Language Backbone
-        self.backbone = EagleBackbone(**config.backbone_cfg)
-
-        # System 1: Diffusion Transformer Action Head
-        action_head_cfg = FlowmatchingActionHeadConfig(**config.action_head_cfg)
-        self.action_head = FlowmatchingActionHead(action_head_cfg)
+# From modeling_eagle2_5_vl.py
+if config.vision_config.model_type == "siglip_vision_model":
+    config.vision_config._attn_implementation = "flash_attention_2"
+    self.vision_model = SiglipVisionModel(config.vision_config)
 ```
 
-![Dual-System Architecture](assets/images/groot_architecture.png)
-<!-- TODO: Add architecture diagram showing System 1 + System 2 -->
+#### MLP Connector: mlp1
 
-<a id="eagle-vlm-backbone"></a>
-### Eagle VLM Backbone
+The connector projects vision features to match the LLM embedding dimension. Two variants exist:
 
-The vision-language module uses Eagle-2 VLM (SigLIP-2 + SmolLM2):
-
-> "For encoding vision and language inputs, GR00T N1 uses the Eagle-2 vision-language model (VLM) pretrained on Internet-scale data. Eagle-2 is finetuned from a SmolLM2 LLM and a SigLIP-2 image encoder. Images are encoded at resolution 224×224 followed by pixel shuffle, resulting in 64 image token embeddings per frame."
-> — *GR00T N1.5 White Paper, Section 2.1*
-
-| White Paper Concept | Implementation Detail |
-|---------------------|----------------------|
-| Image resolution 224×224 | Handled by transforms in `gr00t/model/transforms.py` |
-| 64 image tokens per frame | Pixel shuffle in Eagle-2 model |
-| Middle-layer embeddings (12th layer) | `select_layer` parameter, layers after are removed |
-| Frozen LLM by default | `tune_llm: bool = False` |
-
-**Key Implementation** (`gr00t/model/backbone/eagle_backbone.py`):
+**2-layer connector** (when `mlp_connector_layers=2` and `use_pixel_shuffle=True`):
 ```python
-class EagleBackbone(nn.Module):
+self.mlp1 = nn.Sequential(
+    nn.LayerNorm(vit_hidden_size * int(1/downsample_ratio)**2),  # 1152 * 4 = 4608
+    nn.Linear(4608, 2048),   # Project to LLM dim
+    nn.GELU(),
+    nn.Linear(2048, 2048),   # Refine
+)
+```
+
+**1-layer connector** (when `mlp_connector_layers=1`):
+```python
+self.mlp1 = nn.Sequential(
+    nn.Linear(vit_hidden_size, llm_hidden_size),  # 1152 → 2048
+)
+```
+
+#### Language Model: Qwen3ForCausalLM
+
+The Qwen3 decoder-only transformer processes the fused vision-language embeddings:
+
+```python
+# From modeling_eagle2_5_vl.py
+if config.text_config.architectures[0] == "Qwen3ForCausalLM":
+    self.language_model = Qwen3ForCausalLM(config.text_config)
+```
+
+The model replaces `<image>` placeholder tokens with projected vision embeddings before LLM processing.
+
+#### Configuration Parameters
+
+The following configuration values are from the HuggingFace config at `lerobot/eagle2hg-processor-groot-n1p5`:
+
+| Config Parameter | Value | Controls |
+|------------------|-------|----------|
+| **Vision Config** | | |
+| `vision_config.model_type` | `"siglip_vision_model"` | Which vision encoder class |
+| `vision_config.image_size` | `224` | Input image resolution |
+| `vision_config.patch_size` | `14` | ViT patch size → 16×16 = 256 patches |
+| `vision_config.hidden_size` | `1152` | Vision embedding dimension |
+| `vision_config.num_hidden_layers` | `27` | ViT depth |
+| `vision_config.num_attention_heads` | `16` | ViT attention heads |
+| **Text Config** | | |
+| `text_config.architectures[0]` | `"Qwen3ForCausalLM"` | Which LLM class |
+| `text_config.hidden_size` | `2048` | LLM embedding dimension |
+| `text_config.num_hidden_layers` | `28` | LLM depth |
+| `text_config.num_attention_heads` | `16` | LLM attention heads |
+| `text_config.num_key_value_heads` | `8` | Grouped Query Attention heads |
+| `text_config.intermediate_size` | `6144` | FFN dimension |
+| `text_config.vocab_size` | `151680` | Vocabulary size |
+| **Eagle-Specific** | | |
+| `force_image_size` | `224` | Override vision image size |
+| `downsample_ratio` | `0.5` | Pixel shuffle downsampling factor |
+| `use_pixel_shuffle` | `false` | Enable spatial downsampling |
+| `mlp_connector_layers` | `1` | MLP connector depth (1 or 2) |
+| `select_layer` | `-1` | Which ViT layer to extract (-1 = last) |
+| `image_token_index` | `151669` | Token ID for `<image>` placeholder |
+| `dynamic_image_size` | `true` | Variable resolution tiling |
+| `max_dynamic_tiles` | `12` | Max tiles for high-res images |
+| `use_backbone_lora` | `0` | LoRA rank for vision (0 = disabled) |
+| `use_llm_lora` | `0` | LoRA rank for LLM (0 = disabled) |
+
+#### Architecture Block Diagram
+
+```mermaid
+flowchart TB
+    subgraph Input ["📥 Input"]
+        IMG["🖼️ Images<br/>(pixel_values)<br/>[B, C, 224, 224]"]
+        TXT["📝 Text Tokens<br/>(input_ids)<br/>[B, seq_len]"]
+    end
+
+    subgraph VisionEncoder ["🔭 Vision Encoder: SiglipVisionModel"]
+        direction TB
+        PATCH["Patch Embedding<br/>patch_size=14<br/>→ 16×16 = 256 patches"]
+        VIT["SigLIP-2 ViT<br/>───────────────<br/>hidden_size: 1152<br/>num_layers: 27<br/>num_heads: 16<br/>attn: flash_attention_2"]
+        VOUT["Vision Features<br/>[B, 256, 1152]"]
+
+        PATCH --> VIT --> VOUT
+    end
+
+    subgraph Connector ["🔗 MLP Connector: mlp1"]
+        direction TB
+        PS["Pixel Shuffle<br/>(optional)<br/>downsample_ratio=0.5<br/>Groups 2×2 patches"]
+        LN["LayerNorm<br/>(if 2-layer)"]
+        L1["Linear<br/>1152 → 2048"]
+        GELU["GELU"]
+        L2["Linear<br/>2048 → 2048<br/>(if 2-layer)"]
+        COUT["Projected Features<br/>[B, 256, 2048]"]
+
+        PS -.->|"use_pixel_shuffle=true"| LN
+        LN --> L1 --> GELU --> L2 --> COUT
+        PS -.->|"use_pixel_shuffle=false"| L1
+    end
+
+    subgraph Fusion ["🔀 Multimodal Fusion"]
+        direction TB
+        EMBED["Text Embedding<br/>vocab_size: 151680"]
+        REPLACE["Replace image tokens<br/>image_token_index: 151669<br/>with vision embeddings"]
+        FUSED["Fused Embeddings<br/>[B, seq_len, 2048]"]
+
+        EMBED --> REPLACE --> FUSED
+    end
+
+    subgraph LLM ["🧠 Language Model: Qwen3ForCausalLM"]
+        direction TB
+        QWEN["Qwen3-1.7B Decoder<br/>─────────────────<br/>hidden_size: 2048<br/>num_layers: 28<br/>num_heads: 16<br/>num_kv_heads: 8 (GQA)<br/>intermediate: 6144<br/>attn: flash_attention_2"]
+        HEAD["LM Head<br/>2048 → 151680"]
+        LOGITS["Output Logits<br/>[B, seq_len, vocab_size]"]
+
+        QWEN --> HEAD --> LOGITS
+    end
+
+    subgraph LoRA ["🎛️ LoRA Adapters (Optional)"]
+        VLORA["Vision LoRA<br/>targets: q,k,v,out,fc1,fc2"]
+        LLORA["LLM LoRA<br/>targets: q,k,v,o,gate,down,up"]
+    end
+
+    IMG --> PATCH
+    VOUT --> PS
+    TXT --> EMBED
+    COUT --> REPLACE
+    FUSED --> QWEN
+
+    VLORA -.->|"use_backbone_lora > 0"| VIT
+    LLORA -.->|"use_llm_lora > 0"| QWEN
+```
+
+#### Component Instantiation Summary
+
+| Line | Code | Component | Config Source |
+|------|------|-----------|---------------|
+| 106-110 | `SiglipVisionModel(config.vision_config)` | Vision Encoder | `Eagle25VLConfig.vision_config` |
+| 120-127 | `Qwen3ForCausalLM(config.text_config)` | Language Model | `Eagle25VLConfig.text_config` |
+| 133-149 | `nn.Sequential(LayerNorm, Linear, GELU, Linear)` | MLP Connector | `mlp_connector_layers`, `downsample_ratio` |
+| 154-155 | `get_peft_model(vision_model, lora_config)` | Vision LoRA | `use_backbone_lora` |
+| 158-159 | `get_peft_model(language_model, lora_config)` | LLM LoRA | `use_llm_lora` |
+
+#### Derived Values
+
+```python
+# From config values
+image_size = 224          # force_image_size or vision_config.image_size
+patch_size = 14           # vision_config.patch_size
+num_patches = (224/14)² = 256
+
+# With pixel_shuffle=true, downsample_ratio=0.5:
+#   Groups 2×2 patches → 64 tokens with 4× channel dim (4608)
+# With pixel_shuffle=false (as in HF config):
+#   256 tokens with 1152 channels → project directly to 2048
+```
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py`
+
+<a id="lora-adapter"></a>
+### LoRA Adapter
+
+Low-Rank Adaptation (LoRA) enables parameter-efficient fine-tuning by injecting trainable low-rank matrices into frozen pretrained layers. This section documents how LoRA adapters are attached to the vision backbone and language model in `Eagle25VLForConditionalGeneration`.
+
+#### Attachment Mechanism
+
+##### Vision Encoder LoRA: `wrap_backbone_lora()`
+
+The `wrap_backbone_lora()` method attaches LoRA adapters to the SiglipVisionModel:
+
+```python
+def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
+    lora_config = LoraConfig(
+        r=r,
+        target_modules=[
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+            "self_attn.out_proj", "mlp.fc1", "mlp.fc2",
+        ],
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    )
+    self.vision_model = get_peft_model(self.vision_model, lora_config)
+```
+
+**Target Modules (SiglipVisionModel)**:
+
+| Module | Purpose | Original Layer |
+|--------|---------|----------------|
+| `self_attn.q_proj` | Query projection | `nn.Linear(1152, 1152)` |
+| `self_attn.k_proj` | Key projection | `nn.Linear(1152, 1152)` |
+| `self_attn.v_proj` | Value projection | `nn.Linear(1152, 1152)` |
+| `self_attn.out_proj` | Output projection | `nn.Linear(1152, 1152)` |
+| `mlp.fc1` | MLP up-projection | `nn.Linear(1152, 4304)` |
+| `mlp.fc2` | MLP down-projection | `nn.Linear(4304, 1152)` |
+
+##### Language Model LoRA: `wrap_llm_lora()`
+
+The `wrap_llm_lora()` method attaches LoRA adapters to the Qwen3ForCausalLM:
+
+```python
+def wrap_llm_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
+    lora_config = LoraConfig(
+        r=r,
+        target_modules=[
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+            "self_attn.o_proj", "mlp.gate_proj", "mlp.down_proj", "mlp.up_proj",
+        ],
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        task_type="CAUSAL_LM",
+    )
+    self.language_model = get_peft_model(self.language_model, lora_config)
+    self.language_model.enable_input_require_grads()
+```
+
+**Target Modules (Qwen3ForCausalLM)**:
+
+| Module | Purpose | Original Layer |
+|--------|---------|----------------|
+| `self_attn.q_proj` | Query projection | `nn.Linear(2048, 2048)` |
+| `self_attn.k_proj` | Key projection (GQA) | `nn.Linear(2048, 512)` |
+| `self_attn.v_proj` | Value projection (GQA) | `nn.Linear(2048, 512)` |
+| `self_attn.o_proj` | Output projection | `nn.Linear(2048, 2048)` |
+| `mlp.gate_proj` | SwiGLU gate | `nn.Linear(2048, 6144)` |
+| `mlp.up_proj` | SwiGLU up | `nn.Linear(2048, 6144)` |
+| `mlp.down_proj` | SwiGLU down | `nn.Linear(6144, 2048)` |
+
+##### How PEFT Wraps Modules
+
+The `get_peft_model()` function from HuggingFace PEFT:
+
+1. **Traverses** the model's module tree searching for modules matching `target_modules`
+2. **Replaces** each matched `nn.Linear` with a `LoraLayer` wrapper
+3. **Freezes** the original pretrained weights (`weight.requires_grad = False`)
+4. **Adds** trainable low-rank matrices A and B
+
+#### Dimensional Analysis
+
+##### LoRA Low-Rank Decomposition
+
+For a linear layer `W ∈ ℝ^(out_dim × in_dim)`, LoRA computes:
+
+```
+output = W·x + (B @ A)·x · scaling
+       = W·x + ΔW·x · scaling
+
+Where:
+  A ∈ ℝ^(r × in_dim)       # Down-projection (initialized gaussian)
+  B ∈ ℝ^(out_dim × r)      # Up-projection (initialized zero)
+  scaling = lora_alpha / r  # Scaling factor
+```
+
+##### Vision Encoder LoRA Dimensions
+
+With `hidden_size=1152`, `intermediate_size=4304`, `r=128`, `lora_alpha=256`:
+
+| Target Module | in_dim | out_dim | A shape | B shape | LoRA params | Scaling |
+|---------------|--------|---------|---------|---------|-------------|---------|
+| `q_proj` | 1152 | 1152 | (128, 1152) | (1152, 128) | 294,912 | 2.0 |
+| `k_proj` | 1152 | 1152 | (128, 1152) | (1152, 128) | 294,912 | 2.0 |
+| `v_proj` | 1152 | 1152 | (128, 1152) | (1152, 128) | 294,912 | 2.0 |
+| `out_proj` | 1152 | 1152 | (128, 1152) | (1152, 128) | 294,912 | 2.0 |
+| `fc1` | 1152 | 4304 | (128, 1152) | (4304, 128) | 698,624 | 2.0 |
+| `fc2` | 4304 | 1152 | (128, 4304) | (1152, 128) | 698,624 | 2.0 |
+
+**Per-layer LoRA params**: 2,576,896
+**Total Vision LoRA (27 layers)**: ~69.6M parameters
+
+##### Language Model LoRA Dimensions
+
+With `hidden_size=2048`, `intermediate_size=6144`, `num_key_value_heads=8`, `r=128`, `lora_alpha=256`:
+
+| Target Module | in_dim | out_dim | A shape | B shape | LoRA params | Scaling |
+|---------------|--------|---------|---------|---------|-------------|---------|
+| `q_proj` | 2048 | 2048 | (128, 2048) | (2048, 128) | 524,288 | 2.0 |
+| `k_proj` | 2048 | 512 | (128, 2048) | (512, 128) | 327,680 | 2.0 |
+| `v_proj` | 2048 | 512 | (128, 2048) | (512, 128) | 327,680 | 2.0 |
+| `o_proj` | 2048 | 2048 | (128, 2048) | (2048, 128) | 524,288 | 2.0 |
+| `gate_proj` | 2048 | 6144 | (128, 2048) | (6144, 128) | 1,048,576 | 2.0 |
+| `up_proj` | 2048 | 6144 | (128, 2048) | (6144, 128) | 1,048,576 | 2.0 |
+| `down_proj` | 6144 | 2048 | (128, 6144) | (2048, 128) | 1,048,576 | 2.0 |
+
+**Per-layer LoRA params**: 4,849,664
+**Total LLM LoRA (28 layers)**: ~135.8M parameters
+
+#### Configuration Parameters
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `r` (rank) | 128 | Bottleneck dimension for A,B matrices |
+| `lora_alpha` | 2×r = 256 | Scaling numerator (scaling = α/r = 2.0) |
+| `lora_dropout` | 0.05 | Dropout on LoRA path during training |
+| `task_type` | `"CAUSAL_LM"` (LLM only) | Enables causal LM-specific optimizations |
+
+The code uses `lora_alpha = 2 * r`, resulting in a fixed scaling factor of 2.0 regardless of rank:
+
+```python
+# From __init__ (lines 154-159)
+if config.use_backbone_lora:
+    self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora)
+
+if config.use_llm_lora:
+    self.wrap_llm_lora(r=config.use_llm_lora, lora_alpha=2 * config.use_llm_lora)
+```
+
+#### LoRA Architecture Block Diagram
+
+```mermaid
+flowchart TB
+    %% ═══════════════════════════════════════════════════════════════
+    %% SECTION 1: Vision Encoder (Top)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph VisionEncoder["🔭 SiglipVisionModel (27 layers) — Vision Encoder LoRA"]
+        direction TB
+
+        subgraph VLayer["Each Encoder Layer"]
+            direction TB
+
+            subgraph VMHA["Multi-Head Attention"]
+                direction LR
+                VQ["q_proj<br/>───────<br/>W: 1152→1152<br/>A: 128×1152<br/>B: 1152×128"]
+                VK["k_proj<br/>───────<br/>W: 1152→1152<br/>A: 128×1152<br/>B: 1152×128"]
+                VV["v_proj<br/>───────<br/>W: 1152→1152<br/>A: 128×1152<br/>B: 1152×128"]
+                VOUT["out_proj<br/>───────<br/>W: 1152→1152<br/>A: 128×1152<br/>B: 1152×128"]
+            end
+
+            subgraph VMLP["MLP (fc1 → GELU → fc2)"]
+                direction LR
+                VFC1["fc1<br/>───────<br/>W: 1152→4304<br/>A: 128×1152<br/>B: 4304×128"]
+                VFC2["fc2<br/>───────<br/>W: 4304→1152<br/>A: 128×4304<br/>B: 1152×128"]
+            end
+        end
+
+        VCFG["LoRA Config: r=128, α=256, scaling=2.0, dropout=0.05"]
+        VQ & VK & VV & VOUT -.-> VCFG
+        VFC1 & VFC2 -.-> VCFG
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% SECTION 2: Language Model (Middle)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph LLM["🧠 Qwen3ForCausalLM (28 layers) — Language Model LoRA"]
+        direction TB
+
+        subgraph LLayer["Each Decoder Layer"]
+            direction TB
+
+            subgraph LMHA["Multi-Head Attention (GQA)"]
+                direction LR
+                LQ["q_proj<br/>───────<br/>W: 2048→2048<br/>A: 128×2048<br/>B: 2048×128"]
+                LK["k_proj<br/>───────<br/>W: 2048→512<br/>A: 128×2048<br/>B: 512×128"]
+                LV["v_proj<br/>───────<br/>W: 2048→512<br/>A: 128×2048<br/>B: 512×128"]
+                LO["o_proj<br/>───────<br/>W: 2048→2048<br/>A: 128×2048<br/>B: 2048×128"]
+            end
+
+            subgraph LMLP["SwiGLU MLP"]
+                direction LR
+                LGATE["gate_proj<br/>───────<br/>W: 2048→6144<br/>A: 128×2048<br/>B: 6144×128"]
+                LUP["up_proj<br/>───────<br/>W: 2048→6144<br/>A: 128×2048<br/>B: 6144×128"]
+                LDOWN["down_proj<br/>───────<br/>W: 6144→2048<br/>A: 128×6144<br/>B: 2048×128"]
+            end
+        end
+
+        LCFG["LoRA Config: r=128, α=256, scaling=2.0, dropout=0.05, task=CAUSAL_LM"]
+        LQ & LK & LV & LO -.-> LCFG
+        LGATE & LUP & LDOWN -.-> LCFG
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% SECTION 3: LoRA Forward Pass Math (Bottom)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph LoRAMath["🔢 LoRA Forward Pass — Applied to Each Adapted Layer"]
+        direction TB
+
+        subgraph ForwardFlow["Forward Computation"]
+            direction LR
+            INPUT["x<br/>(input)"]
+
+            subgraph Pretrained["Frozen Path"]
+                ORIG["W<br/>(frozen pretrained)"]
+            end
+
+            subgraph LoRAPath["LoRA Path (trainable)"]
+                LORA_A["A<br/>r × in_dim"]
+                LORA_B["B<br/>out_dim × r"]
+            end
+
+            SUM["⊕<br/>sum"]
+            OUTPUT["y<br/>(output)"]
+
+            INPUT --> ORIG
+            INPUT --> LORA_A
+            LORA_A -->|"bottleneck"| LORA_B
+            ORIG -->|"Wx"| SUM
+            LORA_B -->|"BAx × (α/r)"| SUM
+            SUM --> OUTPUT
+        end
+
+        FORMULA["Formula: y = Wx + BAx · (α/r) = Wx + ΔWx · scaling"]
+    end
+
+    %% Vertical stacking connections (invisible, for layout)
+    VisionEncoder ~~~ LLM
+    LLM ~~~ LoRAMath
+```
+
+#### Implementation Details
+
+1. **Conditional Attachment**: LoRA is only applied when `config.use_backbone_lora > 0` or `config.use_llm_lora > 0`. The config value specifies the LoRA rank `r`.
+
+2. **Default Configuration**: In the default GR00T-N1.5-3B config, both `use_backbone_lora` and `use_llm_lora` are set to `0` (disabled).
+
+3. **LLM-specific Setup**: `wrap_llm_lora()` additionally:
+   - Calls `enable_input_require_grads()` — Enables gradient computation for inputs (required for PEFT)
+   - Sets `task_type="CAUSAL_LM"` — Optimizes for autoregressive generation
+
+4. **Module Naming Conventions**:
+   - Vision (SigLIP): Uses `out_proj` for attention output projection
+   - LLM (Qwen): Uses `o_proj` for attention output projection
+
+5. **Trainable Parameter Logging**: Both wrapper functions call `print_trainable_parameters()` to log the percentage of trainable params after LoRA attachment.
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py` (lines 154-206)
+
+<a id="fine-tunable-parameters"></a>
+### Fine-Tunable Parameters
+
+This section documents the parameter-efficient fine-tuning strategy in GR00T N1.5, clarifying which weights are frozen vs. fine-tunable, how LoRA interacts with the `tune_*` flags, and providing accurate parameter counts for different configurations.
+
+#### Fine-Tuning vs. Training from Scratch
+
+**Critical clarification**: GR00T N1.5 fine-tuning loads **ALL weights** from NVIDIA's pretrained checkpoint (`nvidia/GR00T-N1.5-3B`). The `tune_*` flags control which pretrained weights are **frozen** (kept constant) vs. **fine-tunable** (updated during training).
+
+| Term | Definition |
+|------|------------|
+| **Pretrained weights** | Weights loaded from `nvidia/GR00T-N1.5-3B` checkpoint (all components except LoRA) |
+| **Frozen parameters** | Pretrained weights with `requires_grad=False` — loaded from checkpoint but not updated during training |
+| **Fine-tunable parameters** | Pretrained weights with `requires_grad=True` — loaded from checkpoint and updated during training |
+| **Randomly initialized** | Only LoRA adapter matrices (A, B) — not from any checkpoint |
+
+The weight loading flow in `GR00TN15.from_pretrained()`:
+
+```python
+@classmethod
+def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+    # Downloads nvidia/GR00T-N1.5-3B to ~/.cache/huggingface/hub/
+    local_model_path = snapshot_download(pretrained_model_name_or_path, repo_type="model")
+
+    # Calls parent's from_pretrained which loads model.safetensors
+    pretrained_model = super().from_pretrained(
+        local_model_path, local_model_path=local_model_path, **kwargs
+    )
+
+    # THEN applies tune flags to freeze/unfreeze already-loaded pretrained weights
+    pretrained_model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
+    pretrained_model.action_head.set_trainable_parameters(
+        tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
+    )
+    return pretrained_model
+```
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/groot_n1.py` (lines 343-376)
+
+##### Weight Initialization by Component
+
+| Component | Source | Pretrained From | Randomly Initialized? |
+|-----------|--------|-----------------|----------------------|
+| **SiglipVisionModel** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint (derived from Google SigLIP) | ❌ No |
+| **Qwen3 LLM (12 layers)** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint (derived from Alibaba Qwen3) | ❌ No |
+| **MLP Connector (mlp1)** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint | ❌ No |
+| **Eagle Linear** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint | ❌ No |
+| **DiT Action Head** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint | ❌ No |
+| **State/Action Encoders** | `nvidia/GR00T-N1.5-3B` | ✅ NVIDIA checkpoint | ❌ No |
+| **LoRA Adapters (A, B matrices)** | N/A | ❌ **Randomly initialized** (A~N(0, σ), B=0) | ✅ **Yes** |
+
+> **Note**: LoRA adapters are the **only randomly initialized** components. PEFT's `get_peft_model()` initializes Matrix A with a normal distribution `N(0, σ)` and Matrix B with zeros (so LoRA output starts as zero, preserving pretrained behavior).
+
+#### Parameter Control: `tune_llm` and `tune_visual`
+
+The `EagleBackbone.set_trainable_parameters()` method controls which backbone modules have trainable parameters:
+
+```python
+def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
+    self.tune_llm = tune_llm
+    self.tune_visual = tune_visual
+    for p in self.parameters():
+        p.requires_grad = True   # Start by making everything trainable
+    if not tune_llm:
+        self.eagle_model.language_model.requires_grad_(False)
+    if not tune_visual:
+        self.eagle_model.vision_model.requires_grad_(False)
+        self.eagle_model.mlp1.requires_grad_(False)  # MLP connector frozen with vision
+```
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/groot_n1.py` (lines 99-117)
+
+| Flag | When `False` (Frozen) | When `True` (Fine-Tunable) |
+|------|----------------------|---------------------------|
+| `tune_llm` | `language_model` (Qwen3-2B layers 0-11, ~1.12B params) — pretrained weights frozen | Full LLM backbone fine-tunable |
+| `tune_visual` | `vision_model` (SigLIP ViT, ~400M params) + `mlp1` (MLP connector, ~2.4M params) — pretrained weights frozen | Both vision encoder and connector fine-tunable |
+
+> **Important**: The `mlp1` connector is bundled with `tune_visual`, not separately controllable. Setting `tune_visual=False` freezes both the vision encoder AND the MLP connector.
+
+#### Eval Mode for Frozen Modules
+
+When frozen modules are set to training mode, they still maintain their pretrained weights but may have active dropout/batchnorm layers. The `set_frozen_modules_to_eval_mode()` method ensures frozen modules behave deterministically:
+
+```python
+def set_frozen_modules_to_eval_mode(self):
+    """Set frozen modules to eval mode to disable dropout and batchnorm updates."""
+    if self.training:
+        if self.eagle_model.language_model and not self.tune_llm:
+            self.eagle_model.language_model.eval()  # Disables dropout/batchnorm training
+        if self.eagle_model.vision_model and not self.tune_visual:
+            self.eagle_model.vision_model.eval()
+```
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/groot_n1.py` (lines 119-129)
+
+**Why this matters**:
+- **Dropout layers**: In training mode, dropout randomly zeros elements even for frozen modules, introducing unwanted stochasticity
+- **BatchNorm layers**: In training mode, running statistics are updated even for frozen modules
+- **Solution**: Calling `.eval()` on frozen modules ensures deterministic forward passes while the rest of the model trains normally
+
+#### LoRA Interaction with Tune Flags
+
+LoRA adapters are attached **at model construction time** in `Eagle25VLForConditionalGeneration.__init__()`, not through the `tune_*` flags. The interaction between these two mechanisms determines the final trainability:
+
+| Scenario | Configuration | Behavior | Recommendation |
+|----------|---------------|----------|----------------|
+| **LoRA-only LLM** | `tune_llm=False`, `use_llm_lora=128` | ✅ LLM base weights frozen, only LoRA A/B matrices trainable. PEFT's `get_peft_model()` automatically sets base weights to `requires_grad=False` and LoRA weights to `requires_grad=True` | ✅ **Recommended** — Parameter-efficient, preserves pretrained knowledge |
+| **Full LLM tuning** | `tune_llm=True`, `use_llm_lora=0` | ⚠️ All ~1.12B LLM parameters fine-tunable (expensive, risk of overfitting) | ⚠️ Use only with large datasets |
+| **Hybrid (LoRA + Full)** | `tune_llm=True`, `use_llm_lora=128` | ⚠️ **Both** base weights AND LoRA adapters trainable — wasteful since LoRA's purpose is to avoid full tuning | ❌ **Not recommended** — Redundant |
+| **LoRA-only Vision** | `tune_visual=False`, `use_backbone_lora=128` | ✅ Vision base weights frozen, LoRA adapters trainable | ✅ **Recommended** for novel visual domains |
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py` (lines 154-159, 170-206)
+
+#### Fine-Tunable Parameter Calculation
+
+This section provides mathematical calculations for the number of fine-tunable parameters in different GR00T-N1.5-3B configurations.
+
+##### Model Architecture Dimensions
+
+| Component | Parameter | Value |
+|-----------|-----------|-------|
+| **SigLIP Vision Encoder** | | |
+| `hidden_size` | `d_v` | 1152 |
+| `num_hidden_layers` | `L_v` | 27 |
+| `num_attention_heads` | | 16 |
+| `intermediate_size` | | 4 × 1152 = 4608 |
+| `patch_size` | | 14 |
+| **Qwen3 LLM** (12 layers used) | | |
+| `hidden_size` | `d_l` | 2048 |
+| `num_hidden_layers` | `L_l` | 12 (`select_layer=-1` removes layers 12-27) |
+| `intermediate_size` | | 8192 |
+| `num_attention_heads` | | 16 |
+| **MLP Connector** | | |
+| Input dim | | 1152 (no pixel shuffle) |
+| Output dim | | 2048 |
+| **DiT Action Head** | | |
+| `inner_dim` | `d_dit` | 8 × 64 = 512 |
+| `num_layers` | | 12 |
+| **Projection Layer** | | |
+| `eagle_linear` | | 2048 → 1536 |
+
+##### Component Parameter Counts
+
+**Vision Encoder (SigLIP ViT-L) — ~400M parameters**:
+```
+Per transformer block:
+  Self-attention: 4 × d_v × d_v = 4 × 1152² = 5,308,416
+  MLP (fc1 + fc2): 2 × d_v × 4d_v = 2 × 1152 × 4608 = 10,616,832
+  LayerNorms: 2 × 2 × d_v = 4,608
+  Total per block: ~15.9M
+
+Total vision encoder:
+  Patch embedding: 3 × 14² × 1152 + 1152 = 677,376
+  27 transformer blocks: 27 × 15.9M ≈ 429M
+  Position embedding + class token: ~263K
+  ─────────────────────────────────────────
+  Vision Encoder Total: ~400M parameters
+```
+
+**Language Model (Qwen3-2B, 12 layers) — ~1.12B parameters**:
+```
+Per transformer block:
+  Self-attention (Q, K, V, O): 4 × d_l × d_l = 4 × 2048² = 16,777,216
+  MLP (gate, up, down): 3 × d_l × 8192 = 50,331,648
+  LayerNorms: 2 × 2 × d_l = 8,192
+  Total per block: ~67M
+
+Total LLM (12 layers):
+  Token embedding: 151680 × 2048 = 310.6M
+  12 transformer blocks: 12 × 67M = 804M
+  Final LayerNorm: 2 × 2048 = 4,096
+  LM Head: 2048 × 151680 = 310.6M (tied with embedding)
+  ─────────────────────────────────────────
+  LLM Total (12 layers): ~1.12B parameters
+```
+
+**MLP Connector — ~2.4M parameters** (without pixel shuffle):
+```
+Linear(1152 → 2048): 1152 × 2048 + 2048 = 2,361,344
+```
+
+**Eagle Linear — ~3.1M parameters**:
+```
+Linear(2048 → 1536): 2048 × 1536 + 1536 = 3,147,264
+```
+
+**DiT Action Head — ~70M parameters**:
+```
+Per transformer block:
+  Cross-attention (Q, K, V, O): 4 × d_dit × d_dit = 4 × 512² = 1,048,576
+  Feed-forward (GEGLU): 2 × d_dit × 4 × d_dit = 4,194,304
+  AdaLN + norms: ~20K
+  Total per block: ~5.3M
+
+Total DiT:
+  12 transformer blocks: 12 × 5.3M = 63.6M
+  Timestep encoder: ~1M
+  Output projection: 512 × 1024 + 512 × output_dim ≈ 0.5M
+  State/Action encoders: ~3M
+  Position embeddings: ~0.5M
+  ─────────────────────────────────────────
+  DiT Action Head Total: ~70M parameters
+```
+
+##### LoRA Parameter Calculation
+
+LoRA adds low-rank matrices A ∈ ℝ^(r×d_in) and B ∈ ℝ^(d_out×r) to each target layer:
+```
+LoRA params per layer = r × (d_in + d_out)
+```
+
+**Vision LoRA (r=128)** — 6 targets per block × 27 blocks:
+```
+Per block targets:
+  q_proj, k_proj, v_proj, out_proj: 4 × 128 × (1152 + 1152) = 1,179,648
+  fc1: 128 × (1152 + 4608) = 737,280
+  fc2: 128 × (4608 + 1152) = 737,280
+  ─────────────────────────
+  Per block: 2,654,208
+
+27 blocks × 2.65M = ~71.7M LoRA parameters
+```
+
+**LLM LoRA (r=128)** — 7 targets per block × 12 blocks:
+```
+Per block targets:
+  q_proj, k_proj, v_proj, o_proj: 4 × 128 × (2048 + 2048) = 2,097,152
+  gate_proj: 128 × (2048 + 8192) = 1,310,720
+  down_proj: 128 × (8192 + 2048) = 1,310,720
+  up_proj: 128 × (2048 + 8192) = 1,310,720
+  ─────────────────────────
+  Per block: 6,029,312
+
+12 blocks × 6.03M = ~72.4M LoRA parameters
+```
+
+##### Configuration Comparison
+
+| Configuration | Vision Encoder | LLM Backbone | MLP Connector | Eagle Linear | DiT Action Head | **Total Fine-Tunable** |
+|---------------|----------------|--------------|---------------|--------------|-----------------|------------------------|
+| **Full Fine-Tuning** | 🔓 400M | 🔓 1.12B | 🔓 2.4M | 🔓 3.1M | 🔓 70M | **~1.6B** |
+| `tune_visual=True, tune_llm=True` | (pretrained→fine-tuned) | (pretrained→fine-tuned) | | | | |
+| **LoRA-Only (r=128)** | 🔒 400M + 🆕 72M | 🔒 1.12B + 🆕 72M | 🔒 2.4M | 🔓 3.1M | 🔓 70M | **~217M** |
+| `tune_*=False, use_*_lora=128` | (frozen + LoRA) | (frozen + LoRA) | (frozen) | | | |
+| **Default Config** | 🔒 400M | 🔒 1.12B | 🔒 2.4M | 🔓 3.1M | 🔓 70M | **~73M** |
+| `tune_visual=False, tune_llm=False` | (pretrained→frozen) | (pretrained→frozen) | (frozen) | | | |
+
+**Legend**:
+- 🔓 = Pretrained weights loaded from NVIDIA checkpoint, **fine-tuned** (gradients enabled)
+- 🔒 = Pretrained weights loaded from NVIDIA checkpoint, **frozen** (gradients disabled)
+- 🆕 = Randomly initialized (LoRA adapters only)
+
+#### Total Model Size: 3B Parameters Explained
+
+The advertised "GR00T-N1.5-3B" model size refers to the **total checkpoint size**, which includes the full Qwen3-2B backbone before layer pruning:
+
+| Component | Parameters | Notes |
+|-----------|------------|-------|
+| **Qwen3-2B LLM (full 28 layers)** | ~2.0B | Full pretrained backbone in checkpoint |
+| **SigLIP Vision Encoder** | ~400M | SigLIP-2 ViT-L/14 |
+| **MLP Connector** | ~2.4M | Projects vision → LLM space |
+| **Eagle Linear** | ~3.1M | Projects LLM → action head space |
+| **DiT Action Head** | ~70M | Flow-matching diffusion transformer |
+| **State/Action Encoders** | ~10M | Multi-embodiment projectors |
+| **Total Checkpoint** | **~2.5B** | Stored in `model.safetensors` |
+
+> **Note**: The "3B" naming is approximate. The actual checkpoint is ~2.5B parameters, rounded up for marketing.
+
+**Active Parameters During Inference**:
+
+GR00T N1.5 uses only 12 LLM layers (`select_layer=-1` removes layers 12-27 at model construction):
+
+```python
+# From groot_n1.py lines 92-94
+while len(self.eagle_model.language_model.model.layers) > select_layer:
+    self.eagle_model.language_model.model.layers.pop(-1)  # Removes layers 12-27
+```
+
+This reduces the active LLM parameters from ~2.0B to ~1.12B, resulting in:
+
+| Metric | Full Checkpoint | Active During Inference |
+|--------|-----------------|------------------------|
+| LLM parameters | ~2.0B (28 layers) | ~1.12B (12 layers) |
+| Vision parameters | ~400M | ~400M |
+| Action head | ~70M | ~70M |
+| **Total** | **~2.5B** | **~1.6B** |
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/groot_n1.py` (lines 92-94)
+
+<a id="pixel-shuffle-operation"></a>
+### Pixel Shuffle Operation
+
+Pixel shuffle (also known as **space-to-depth** in this context) is a spatial reorganization operation that trades spatial resolution for channel depth. It reduces the number of vision tokens while preserving information by packing spatial neighbors into the channel dimension.
+
+#### Dimensional Impact
+
+```mermaid
+flowchart TB
+    %% ═══════════════════════════════════════════════════════════════
+    %% CASE A: Pixel Shuffle ENABLED
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph CaseA["🔀 Case A: use_pixel_shuffle=True, downsample_ratio=0.5"]
+        direction TB
+
+        A_VIT["🔭 Vision Encoder Output<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 256, 1152]<br/>256 patches × 1152-dim"]
+
+        A_RESHAPE["📐 Reshape to 2D Grid<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 16, 16, 1152]<br/>16×16 spatial grid"]
+
+        A_SHUFFLE["🔀 Pixel Shuffle (scale=0.5)<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 8, 8, 4608]<br/>2×2 patches merged<br/>channels × 4"]
+
+        A_FLATTEN["📏 Flatten<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 64, 4608]<br/>64 tokens × 4608-dim"]
+
+        subgraph A_MLP["🔗 MLP Connector (2-layer)"]
+            A_LN["LayerNorm(4608)"]
+            A_L1["Linear(4608 → 2048)"]
+            A_GELU["GELU()"]
+            A_L2["Linear(2048 → 2048)"]
+            A_LN --> A_L1 --> A_GELU --> A_L2
+        end
+
+        A_OUT["🧠 Output to LLM<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 64, 2048]<br/>64 vision tokens"]
+
+        A_VIT --> A_RESHAPE --> A_SHUFFLE --> A_FLATTEN --> A_MLP --> A_OUT
+    end
+
+    %% ═══════════════════════════════════════════════════════════════
+    %% CASE B: Pixel Shuffle DISABLED (GR00T Default)
+    %% ═══════════════════════════════════════════════════════════════
+    subgraph CaseB["⚡ Case B: use_pixel_shuffle=False (GR00T-N1.5-3B Default)"]
+        direction TB
+
+        B_VIT["🔭 Vision Encoder Output<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 256, 1152]<br/>256 patches × 1152-dim"]
+
+        B_DIRECT["↓ Direct Pass<br/>(no reshape/shuffle)"]
+
+        subgraph B_MLP["🔗 MLP Connector (1-layer)"]
+            B_L1["Linear(1152 → 2048)"]
+        end
+
+        B_OUT["🧠 Output to LLM<br/>━━━━━━━━━━━━━━━━━━━━<br/>[B, 256, 2048]<br/>256 vision tokens"]
+
+        B_VIT --> B_DIRECT --> B_MLP --> B_OUT
+    end
+
+    %% Vertical stacking
+    CaseA ~~~ CaseB
+```
+
+##### Comparison Table
+
+| Metric | Pixel Shuffle ON | Pixel Shuffle OFF |
+|--------|------------------|-------------------|
+| **Token count** | 64 | 256 |
+| **Channel dim (pre-MLP)** | 4608 | 1152 |
+| **MLP connector layers** | 2 (typical) | 1 |
+| **LLM context length impact** | 4× fewer vision tokens | Full resolution |
+| **Information preservation** | All info packed in channels | All info in spatial layout |
+| **Receptive field per token** | 2×2 = 4 patches | 1 patch |
+
+##### MLP Connector Variants
+
+The MLP connector configuration depends on `use_pixel_shuffle` and `mlp_connector_layers`:
+
+| Configuration | Input Dim | MLP Architecture | Output Dim |
+|---------------|-----------|------------------|------------|
+| `mlp_connector_layers=2` (with pixel shuffle) | 4608 | LayerNorm(4608) → Linear(4608→2048) → GELU → Linear(2048→2048) | 2048 |
+| `mlp_connector_layers=1`, `use_pixel_shuffle=True` | 4608 | Linear(4608→2048) | 2048 |
+| `mlp_connector_layers=1`, `use_pixel_shuffle=False` | 1152 | Linear(1152→2048) | 2048 |
+
+The input dimension formula when pixel shuffle is enabled:
+```
+input_dim = vit_hidden_size × (1 / downsample_ratio)²
+          = 1152 × (1 / 0.5)²
+          = 1152 × 4
+          = 4608
+```
+
+#### Trade-offs
+
+| Aspect | Pixel Shuffle ON | Pixel Shuffle OFF |
+|--------|------------------|-------------------|
+| **Pros** | | |
+| LLM inference speed | ✅ 4× fewer tokens = faster | ❌ More tokens = slower |
+| Memory efficiency | ✅ Smaller KV cache | ❌ Larger KV cache |
+| Multi-image handling | ✅ Better scaling with many images | ❌ Context fills quickly |
+| **Cons** | | |
+| Fine-grained spatial info | ❌ 2×2 patches merged | ✅ Full spatial resolution |
+| MLP connector complexity | ❌ Larger input dim (4608) | ✅ Smaller input dim (1152) |
+| Connector parameters | ❌ More params: Linear(4608→2048) | ✅ Fewer params: Linear(1152→2048) |
+
+##### Why GR00T-N1.5-3B Uses `use_pixel_shuffle=False`
+
+The default GR00T configuration disables pixel shuffle for several reasons:
+
+1. **Robotics requires spatial precision**: Fine manipulation and visual servoing benefit from higher spatial resolution (256 tokens) rather than compressed representations (64 tokens).
+
+2. **Single-image inference**: Robotics typically processes 1-2 camera views per timestep, so the LLM context length isn't a bottleneck.
+
+3. **Simpler connector**: A single `Linear(1152 → 2048)` layer is more parameter-efficient and faster than the 2-layer variant needed for pixel shuffle.
+
+4. **Action prediction focus**: Unlike VQA tasks where token efficiency matters for long conversations, robotics uses the VLM for action prediction with shorter sequences.
+
+**Code Reference**: `lerobot/src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py` (lines 287-327)
+
+---
+
+<a id="state-encoder"></a>
+### State Encoder
+
+The **State Encoder** projects the robot's current proprioceptive state (joint positions, velocities, etc.) into the same embedding space used by the DiT (Diffusion Transformer). This component is critical for bridging robot-specific state representations to the unified action prediction pipeline.
+
+#### Purpose and Role
+
+1. **Dimension Bridging**: Raw state vectors have variable dimensions depending on the robot embodiment (e.g., 6 joints for SO-101, 7 joints for Franka), while the DiT operates on a fixed 1536-dimensional embedding space.
+
+2. **Conditioning Signal**: The encoded state serves as the **first token** in the DiT's input sequence (`sa_embs`), providing the model with current proprioceptive context for action prediction.
+
+3. **Multi-Embodiment Support**: Different robots have fundamentally different state representations. The State Encoder uses **embodiment-specific MLP weights** to handle this heterogeneity within a single model.
+
+#### Architecture: CategorySpecificMLP
+
+The State Encoder is implemented as a `CategorySpecificMLP`, a two-layer MLP with **per-embodiment weights**:
+
+```python
+# File: flow_matching_action_head.py (lines 56-65)
+class CategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x, cat_ids):
+        hidden = F.relu(self.layer1(x, cat_ids))
+        return self.layer2(hidden, cat_ids)
+```
+
+The underlying `CategorySpecificLinear` stores **separate weight matrices for each embodiment**:
+
+```python
+# File: flow_matching_action_head.py (lines 42-53)
+class CategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        # For each category, we have separate weights and biases.
+        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+    def forward(self, x, cat_ids):
+        selected_w = self.W[cat_ids]   # Index into weight bank
+        selected_b = self.b[cat_ids]   # Index into bias bank
+        return torch.bmm(x, selected_w) + selected_b.unsqueeze(1)
+```
+
+#### Embodiment-Specific Design: Weight Bank Architecture
+
+The key design pattern is the **weight bank** that stores separate parameters for each robot embodiment:
+
+| Layer | Weight Tensor Shape | Description |
+|-------|---------------------|-------------|
+| `layer1.W` | `[32, 64, 1024]` | `[num_embodiments, max_state_dim, hidden_size]` |
+| `layer1.b` | `[32, 1024]` | `[num_embodiments, hidden_size]` |
+| `layer2.W` | `[32, 1024, 1536]` | `[num_embodiments, hidden_size, output_dim]` |
+| `layer2.b` | `[32, 1536]` | `[num_embodiments, output_dim]` |
+
+**How `embodiment_id` Indexing Works**:
+
+```python
+# During forward pass:
+embodiment_id = action_input.embodiment_id  # e.g., tensor([31]) for SO-101
+
+# In CategorySpecificLinear.forward():
+selected_w = self.W[cat_ids]  # Shape: [B, input_dim, hidden_dim]
+# This selects the weight matrix for embodiment 31 from the bank of 32
+```
+
+This design enables:
+- **Single Model, Multiple Robots**: One pretrained checkpoint works for all supported embodiments
+- **Zero-Shot Transfer**: New embodiment configurations can be assigned an ID and leverage shared DiT knowledge
+- **Memory Efficiency**: Only the relevant weights are used during forward pass (via batched indexing)
+
+#### Input/Output Specifications
+
+**Configuration Parameters** (`FlowmatchingActionHeadConfig`):
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `max_num_embodiments` | 32 | Maximum number of robot embodiments supported |
+| `max_state_dim` | 64 | Maximum state vector dimension (padded if smaller) |
+| `hidden_size` | 1024 | Hidden layer dimension |
+| `input_embedding_dim` | 1536 | Output dimension (matches DiT input) |
+
+**Tensor Shapes Through Forward Pass**:
+
+| Stage | Shape | Description |
+|-------|-------|-------------|
+| **Input: state** | `[B, 1, 64]` | Padded state vector (1 token) |
+| **Input: embodiment_id** | `[B]` | Integer ID for each batch item |
+| **Hidden** | `[B, 1, 1024]` | After first linear + ReLU |
+| **Output: state_features** | `[B, 1, 1536]` | DiT-compatible embedding |
+
+**Concrete Example (Bread Dataset with SO-101 arm)**:
+
+```
+Input:
+  - state: (1, 1, 64)
+    ├─ Actual joint positions: 6 values [θ1, θ2, θ3, θ4, θ5, θ6]
+    └─ Padding: 58 zeros (to reach max_state_dim=64)
+  - embodiment_id: (1,) = [31]  (SO-101's assigned ID)
+
+Forward Pass:
+  - layer1: (1, 1, 64) × W[31, 64, 1024] → (1, 1, 1024)
+  - ReLU activation
+  - layer2: (1, 1, 1024) × W[31, 1024, 1536] → (1, 1, 1536)
+
+Output:
+  - state_features: (1, 1, 1536)
+```
+
+#### Code Implementation
+
+**Instantiation** (`flow_matching_action_head.py`, lines 179-184):
+
+```python
+self.state_encoder = CategorySpecificMLP(
+    num_categories=config.max_num_embodiments,  # 32
+    input_dim=config.max_state_dim,             # 64
+    hidden_dim=self.hidden_size,                 # 1024
+    output_dim=self.input_embedding_dim,         # 1536
+)
+```
+
+**Usage in Training Forward Pass** (line 299):
+
+```python
+# In FlowmatchingActionHead.forward()
+embodiment_id = action_input.embodiment_id
+state_features = self.state_encoder(action_input.state, embodiment_id)
+```
+
+**Usage in Inference** (line 354):
+
+```python
+# In FlowmatchingActionHead.get_action()
+state_features = self.state_encoder(action_input.state, embodiment_id)
+```
+
+#### Integration in Action Head Pipeline
+
+The State Encoder is the **first** encoding step in the Action Head:
+
+```mermaid
+flowchart LR
+    subgraph INPUT["Inputs"]
+        S["state<br/>[B, 1, 64]"]
+        E["embodiment_id<br/>[B]"]
+        A["action<br/>[B, 16, 32]"]
+        VL["vl_embs<br/>[B, seq, 1536]"]
+    end
+
+    subgraph ENCODE["Encoding"]
+        SE["state_encoder<br/>CategorySpecificMLP"]
+        AE["action_encoder<br/>MultiEmbodimentActionEncoder"]
+        FT["future_tokens<br/>nn.Embedding(32, 1536)"]
+    end
+
+    subgraph SEQ["Sequence Construction"]
+        CAT["torch.cat(dim=1)"]
+        SA["sa_embs<br/>[B, 49, 1536]"]
+    end
+
+    subgraph DIT["DiT Cross-Attention"]
+        D["DiT.forward()"]
+    end
+
+    S --> SE
+    E --> SE & AE
+    SE -->|"[B,1,1536]"| CAT
+    FT -->|"[B,32,1536]"| CAT
+    A --> AE -->|"[B,16,1536]"| CAT
+    CAT --> SA --> D
+    VL -->|"encoder_hidden_states"| D
+
+    style SE fill:#87CEEB
+```
+
+**Sequence Construction** (`flow_matching_action_head.py`, lines 320-322):
+
+```python
+future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+# sa_embs shape: [B, 1 + 32 + 16, 1536] = [B, 49, 1536]
+```
+
+The `state_features` (1 token) is **prepended** to the sequence, giving the DiT:
+
+| Position | Content | Shape per batch |
+|----------|---------|-----------------|
+| 0 | Current robot state | `[1, 1536]` |
+| 1-32 | Future tokens (learnable) | `[32, 1536]` |
+| 33-48 | Action tokens (noisy trajectory) | `[16, 1536]` |
+
+#### Training Behavior: `--tune-projector` Flag
+
+The `state_encoder` is controlled by the `tune_projector` configuration flag:
+
+**Configuration** (`FlowmatchingActionHeadConfig`, line 140):
+
+```python
+tune_projector: bool = field(default=True, metadata={"help": "Whether to tune the projector."})
+```
+
+**Effect in `set_trainable_parameters()`** (lines 213-227):
+
+```python
+def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
+    for p in self.parameters():
+        p.requires_grad = True  # Start with all trainable
+    if not tune_projector:
+        self.state_encoder.requires_grad_(False)   # ← Freeze state_encoder
+        self.action_encoder.requires_grad_(False)
+        self.action_decoder.requires_grad_(False)
+        if self.config.add_pos_embed:
+            self.position_embedding.requires_grad_(False)
+```
+
+**Components Affected by `tune_projector=False`**:
+
+| Component | Frozen when `tune_projector=False`? |
+|-----------|-------------------------------------|
+| `state_encoder` | ✅ Yes |
+| `action_encoder` | ✅ Yes |
+| `action_decoder` | ✅ Yes |
+| `position_embedding` | ✅ Yes (if `add_pos_embed=True`) |
+| `future_tokens` | ❌ No (always trainable) |
+| `vlln` | ❌ No |
+| `vl_self_attention` | ❌ No |
+| `model` (DiT) | Controlled by `tune_diffusion_model` |
+
+**Typical Fine-Tuning Configurations**:
+
+| Scenario | `tune_projector` | `tune_diffusion_model` | Notes |
+|----------|------------------|------------------------|-------|
+| Full fine-tuning | `True` | `True` | All action head parameters trainable |
+| DiT-only | `False` | `True` | Freeze encoders, tune DiT only |
+| Encoders-only | `True` | `False` | Tune projectors, freeze DiT |
+
+---
+
+<a id="action-encoder"></a>
+### Action Encoder
+
+The **Action Encoder** (`MultiEmbodimentActionEncoder`) projects noisy action trajectories into the DiT embedding space while conditioning on the denoising timestep. Unlike the simpler State Encoder, it requires timestep conditioning to inform the model about the current noise level during flow matching.
+
+#### Architecture Comparison: Action Encoder vs State Encoder
+
+| Aspect | State Encoder | Action Encoder |
+|--------|---------------|----------------|
+| **Class** | `CategorySpecificMLP` | `MultiEmbodimentActionEncoder` |
+| **Layers** | 2 (`layer1`, `layer2`) | 3 (`W1`, `W2`, `W3`) |
+| **Timestep Conditioning** | ❌ None | ✅ Sinusoidal positional encoding |
+| **Activation** | ReLU | Swish (SiLU) |
+| **Feature Concatenation** | ❌ None | ✅ Action + Timestep embeddings |
+| **Input Dimension** | `max_state_dim=64` | `action_dim=32` |
+
+The Action Encoder must encode **both** the noisy action trajectory **and** the denoising timestep, requiring the additional layer and timestep conditioning mechanism.
+
+#### Layer-by-Layer Architecture
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📥 Inputs"]
+        A["actions<br/>(B, T, 32)"]
+        TS["timesteps<br/>(B,)"]
+        CAT["cat_ids<br/>(B,)"]
+    end
+
+    subgraph EXPAND["Timestep Expansion"]
+        EXP["unsqueeze(1).expand(-1, T)<br/>(B,) → (B, T)"]
+    end
+
+    subgraph W1_BLOCK["W1: Action Projection"]
+        W1["CategorySpecificLinear<br/>(32 → 1536)"]
+        A_EMB["a_emb<br/>(B, T, 1536)"]
+    end
+
+    subgraph POS["Timestep Encoding"]
+        SIN["SinusoidalPositionalEncoding<br/>(1536)"]
+        TAU["tau_emb<br/>(B, T, 1536)"]
+    end
+
+    subgraph CONCAT["Feature Concatenation"]
+        CATOP["torch.cat(dim=-1)"]
+        X1["x<br/>(B, T, 3072)"]
+    end
+
+    subgraph W2_BLOCK["W2: Feature Fusion"]
+        W2["CategorySpecificLinear<br/>(3072 → 1536)"]
+        SWISH["swish()"]
+        X2["x<br/>(B, T, 1536)"]
+    end
+
+    subgraph W3_BLOCK["W3: Output Projection"]
+        W3["CategorySpecificLinear<br/>(1536 → 1536)"]
+        OUT["output<br/>(B, T, 1536)"]
+    end
+
+    A --> W1
+    CAT --> W1 & W2 & W3
+    W1 --> A_EMB --> CATOP
+
+    TS --> EXP --> SIN --> TAU --> CATOP
+    CATOP --> X1 --> W2 --> SWISH --> X2 --> W3 --> OUT
+
+    style W1 fill:#87CEEB
+    style W2 fill:#87CEEB
+    style W3 fill:#87CEEB
+    style SIN fill:#FFB6C1
+    style SWISH fill:#98FB98
+```
+
+**Code Implementation** (`flow_matching_action_head.py`, lines 68-110):
+
+```python
+class MultiEmbodimentActionEncoder(nn.Module):
+    def __init__(self, action_dim, hidden_size, num_embodiments):
+        super().__init__()
+        # W1: R^{w x d}, W2: R^{w x 2w}, W3: R^{w x w}
+        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)      # (d → w)
+        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size) # (2w → w)
+        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)     # (w → w)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(self, actions, timesteps, cat_ids):
+        b, t, _ = actions.shape
+
+        # 1) Expand timesteps: (B,) → (B, T)
+        timesteps = timesteps.unsqueeze(1).expand(-1, t)
+
+        # 2) Action projection: (B, T, d) → (B, T, w)
+        a_emb = self.W1(actions, cat_ids)
+
+        # 3) Timestep encoding: (B, T) → (B, T, w)
+        tau_emb = self.pos_encoding(timesteps)
+
+        # 4) Concatenate + W2 + swish: (B, T, 2w) → (B, T, w)
+        x = torch.cat([a_emb, tau_emb], dim=-1)
+        x = swish(self.W2(x, cat_ids))
+
+        # 5) Final projection: (B, T, w) → (B, T, w)
+        x = self.W3(x, cat_ids)
+        return x
+```
+
+#### Timestep Conditioning: SinusoidalPositionalEncoding
+
+The `SinusoidalPositionalEncoding` converts discrete timesteps into continuous embeddings using the same technique as transformer positional encodings:
+
+```python
+# File: action_encoder.py (lines 24-54)
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.embedding_dim = embedding_dim  # 1536
+
+    def forward(self, timesteps):
+        timesteps = timesteps.float()  # (B, T)
+        half_dim = self.embedding_dim // 2  # 768
+
+        # Log-space frequencies: 10000^(-i/half_dim) for i in [0, half_dim)
+        exponent = -torch.arange(half_dim) * (log(10000.0) / half_dim)
+        freqs = timesteps.unsqueeze(-1) * exponent.exp()  # (B, T, 768)
+
+        sin = torch.sin(freqs)
+        cos = torch.cos(freqs)
+        enc = torch.cat([sin, cos], dim=-1)  # (B, T, 1536)
+        return enc
+```
+
+**Mathematical Formulation**:
+
+For timestep `t` and dimension index `i`:
+```
+PE(t, 2i)   = sin(t / 10000^(2i/d))
+PE(t, 2i+1) = cos(t / 10000^(2i/d))
+```
+
+Where `d = 1536` (embedding dimension) and `i ∈ [0, 768)`.
+
+**Why Sinusoidal Encoding for Timesteps?**
+
+| Property | Benefit |
+|----------|---------|
+| **Continuous Representation** | Converts discrete integers (0-999) to smooth, differentiable embeddings |
+| **Unique Signatures** | Each timestep gets a unique embedding pattern |
+| **Interpolation** | Model can generalize to timesteps not seen during training |
+| **No Learned Parameters** | Deterministic encoding, no additional training needed |
+
+#### Activation Function: Swish vs ReLU
+
+The Action Encoder uses **swish** (also known as SiLU) instead of ReLU:
+
+```python
+def swish(x):
+    return x * torch.sigmoid(x)
+```
+
+| Activation | Formula | Used In | Properties |
+|------------|---------|---------|------------|
+| **ReLU** | `max(0, x)` | State Encoder | Hard zero for negatives, sparse gradients |
+| **Swish** | `x * sigmoid(x)` | Action Encoder | Smooth, non-monotonic, self-gated |
+
+**Why Swish for Action Encoding?**
+
+1. **Smooth Gradients**: Swish is smooth everywhere, avoiding the "dying ReLU" problem
+2. **Self-Gating**: The sigmoid component allows the network to learn feature selection
+3. **Non-Monotonic**: Can have small negative outputs for negative inputs, preserving information
+4. **Diffusion Convention**: Swish is commonly used in diffusion model architectures (DDPM, DiT)
+
+**Application Point**: Swish is applied only after W2, not after W3:
+```python
+x = swish(self.W2(x, cat_ids))  # ← swish here
+x = self.W3(x, cat_ids)          # ← no activation (linear output)
+```
+
+#### Embodiment-Specific Design: Weight Bank Shapes
+
+Each `CategorySpecificLinear` layer maintains separate weights for all 32 embodiments:
+
+| Layer | Weight `W` Shape | Bias `b` Shape | Parameters per Layer |
+|-------|------------------|----------------|----------------------|
+| `W1` | `[32, 32, 1536]` | `[32, 1536]` | 32 × (32×1536 + 1536) = 1.62M |
+| `W2` | `[32, 3072, 1536]` | `[32, 1536]` | 32 × (3072×1536 + 1536) = 151.0M |
+| `W3` | `[32, 1536, 1536]` | `[32, 1536]` | 32 × (1536×1536 + 1536) = 75.5M |
+
+**Total Action Encoder Parameters**: ~228.2M
+
+**Instantiation** (`flow_matching_action_head.py`, lines 185-189):
+
+```python
+self.action_encoder = MultiEmbodimentActionEncoder(
+    action_dim=config.action_dim,              # 32
+    hidden_size=self.input_embedding_dim,      # 1536
+    num_embodiments=config.max_num_embodiments # 32
+)
+```
+
+#### Data Flow: Complete Tensor Shape Transformation
+
+**Concrete Example (Bread Dataset with SO-101)**:
+
+```
+Input:
+  - actions: (1, 16, 32)     # 16 timesteps, 32-dim action (6 joints padded)
+  - timesteps: (1,) = [700]  # Discretized from t=0.7
+  - cat_ids: (1,) = [31]     # SO-101 embodiment ID
+
+Step 1: Expand timesteps
+  - (1,) → (1, 16)           # Replicate across action horizon
+
+Step 2: W1 - Action projection
+  - (1, 16, 32) × W1[31, 32, 1536] → (1, 16, 1536)
+  - a_emb: (1, 16, 1536)
+
+Step 3: Sinusoidal positional encoding
+  - (1, 16) → (1, 16, 1536)
+  - tau_emb: (1, 16, 1536)
+
+Step 4: Concatenation
+  - cat([a_emb, tau_emb], dim=-1)
+  - x: (1, 16, 3072)
+
+Step 5: W2 + Swish
+  - (1, 16, 3072) × W2[31, 3072, 1536] → (1, 16, 1536)
+  - swish() applied
+  - x: (1, 16, 1536)
+
+Step 6: W3 - Final projection
+  - (1, 16, 1536) × W3[31, 1536, 1536] → (1, 16, 1536)
+  - x: (1, 16, 1536)
+
+Output:
+  - action_features: (1, 16, 1536)
+```
+
+**Tensor Shape Summary Table**:
+
+| Stage | Tensor | Shape | Description |
+|-------|--------|-------|-------------|
+| Input | `actions` | `[B, 16, 32]` | Noisy action trajectory |
+| Input | `timesteps` | `[B]` | Discrete timestep (0-999) |
+| Expand | `timesteps` | `[B, 16]` | Replicated across horizon |
+| W1 | `a_emb` | `[B, 16, 1536]` | Action embeddings |
+| SinPosEnc | `tau_emb` | `[B, 16, 1536]` | Timestep embeddings |
+| Concat | `x` | `[B, 16, 3072]` | Concatenated features |
+| W2+Swish | `x` | `[B, 16, 1536]` | Fused features |
+| W3 | `output` | `[B, 16, 1536]` | Final action features |
+
+---
+
+<a id="action-decoder"></a>
+### Action Decoder
+
+The **Action Decoder** transforms DiT outputs back to the action space using embodiment-specific weights. Unlike the more complex Action Encoder, the Action Decoder is a straightforward 2-layer MLP that projects from the DiT's hidden dimension to the action dimension.
+
+**Cross-Reference**: For processing flow and Euler integration during inference, see [Section 7: Action Decoding](#7-action-decoding). For the DiT that provides input to the Action Decoder, see [Section 6: Diffusion Transformer (DiT)](#6-diffusion-transformer-dit).
+
+#### Action Decoder Block Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📥 DiT Output"]
+        D1["model_output<br/>(B, 49, 512)"]
+        E1["embodiment_id<br/>(B,)"]
+    end
+
+    subgraph WEIGHTS["🏦 Weight Bank"]
+        W1["layer1.W[embodiment_id]<br/>(512, 512)"]
+        B1["layer1.b[embodiment_id]<br/>(512,)"]
+        W2["layer2.W[embodiment_id]<br/>(512, 32)"]
+        B2["layer2.b[embodiment_id]<br/>(32,)"]
+    end
+
+    subgraph DECODE["🎯 CategorySpecificMLP"]
+        L1["layer1: Linear + ReLU<br/>(B, 49, 512) → (B, 49, 512)"]
+        L2["layer2: Linear (no activation)<br/>(B, 49, 512) → (B, 49, 32)"]
+    end
+
+    subgraph SLICE["✂️ Extraction"]
+        S1["pred[:, -16:, :]<br/>Slice last 16 tokens"]
+        S2["pred_velocity<br/>(B, 16, 32)"]
+    end
+
+    D1 --> L1
+    E1 --> WEIGHTS
+    W1 --> L1
+    B1 --> L1
+    L1 --> L2
+    W2 --> L2
+    B2 --> L2
+    L2 --> S1 --> S2
+
+    style INPUT fill:#e1f5fe
+    style WEIGHTS fill:#fff3e0
+    style DECODE fill:#e8f5e9
+    style SLICE fill:#fce4ec
+```
+
+#### Architecture: `CategorySpecificMLP` Class
+
+The Action Decoder uses the same `CategorySpecificMLP` class as the State Encoder, but with different dimensions:
+
+```python
+# File: flow_matching_action_head.py, lines 56-65
+class CategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x, cat_ids):
+        hidden = F.relu(self.layer1(x, cat_ids))  # ReLU activation
+        return self.layer2(hidden, cat_ids)        # No activation (linear output)
+```
+
+**Instantiation** (`flow_matching_action_head.py`, lines 190-195):
+
+```python
+self.action_decoder = CategorySpecificMLP(
+    num_categories=config.max_num_embodiments,  # 32
+    input_dim=self.hidden_size,                  # 512 (DiT inner_dim)
+    hidden_dim=self.hidden_size,                 # 512
+    output_dim=self.action_dim,                  # 32 (padded action dimension)
+)
+```
+
+#### Weight Bank Structure
+
+Each `CategorySpecificLinear` layer maintains separate weights for all 32 embodiments:
+
+| Layer | Weight `W` Shape | Bias `b` Shape | Parameters per Layer |
+|-------|------------------|----------------|----------------------|
+| `layer1` | `[32, 512, 512]` | `[32, 512]` | 32 × (512×512 + 512) = 8.41M |
+| `layer2` | `[32, 512, 32]` | `[32, 32]` | 32 × (512×32 + 32) = 0.53M |
+
+**Total Action Decoder Parameters**: ~8.9M
+
+The weight bank indexing mechanism (same as State Encoder):
+
+```python
+# File: flow_matching_action_head.py, lines 42-53
+class CategorySpecificLinear(nn.Module):
+    def forward(self, x, cat_ids):
+        selected_w = self.W[cat_ids]  # Index: (B,) → (B, in_dim, out_dim)
+        selected_b = self.b[cat_ids]  # Index: (B,) → (B, out_dim)
+        return torch.bmm(x, selected_w) + selected_b.unsqueeze(1)
+```
+
+#### Input/Output Shape Transformation
+
+| Stage | Shape | Description |
+|-------|-------|-------------|
+| **DiT output** | `(B, 49, 512)` | Full sequence: state(1) + future(32) + action(16) |
+| **After layer1 + ReLU** | `(B, 49, 512)` | Hidden representation |
+| **After layer2** | `(B, 49, 32)` | Projected to action dimension |
+| **Slice `[:, -16:]`** | `(B, 16, 32)` | Extract action tokens only |
+
+**Why Slice the Last 16 Tokens?**
+
+The DiT processes all 49 tokens in `sa_embs`, but only the last 16 positions correspond to action tokens:
+
+| Position Range | Token Type | Purpose |
+|----------------|------------|---------|
+| 0 | State | Proprioceptive encoding (discarded in output) |
+| 1-32 | Future | Target vision tokens (discarded in output) |
+| 33-48 | Action | **Predicted velocities** (extracted for loss/integration) |
+
+**Concrete Example (Bread Dataset with B=1)**:
+
+```
+Input:
+  - model_output: (1, 49, 512)  # DiT hidden states
+  - embodiment_id: (1,) = [31]   # SO-101 embodiment ID
+
+Step 1: layer1 + ReLU
+  - (1, 49, 512) × W_layer1[31, 512, 512] + b_layer1[31, 512]
+  - ReLU activation
+  - hidden: (1, 49, 512)
+
+Step 2: layer2 (linear)
+  - (1, 49, 512) × W_layer2[31, 512, 32] + b_layer2[31, 32]
+  - pred: (1, 49, 32)
+
+Step 3: Slice extraction
+  - pred[:, -16:, :]
+  - pred_velocity: (1, 16, 32)
+
+Output:
+  - pred_velocity: (1, 16, 32)
+  - During training: compared with target velocity via MSE loss
+  - During inference: used for Euler integration a_{t+dt} = a_t + dt * v
+```
+
+#### Comparison: Action Decoder vs. Action Encoder
+
+| Aspect | Action Decoder | Action Encoder |
+|--------|----------------|----------------|
+| **Class** | `CategorySpecificMLP` | `MultiEmbodimentActionEncoder` |
+| **File/Lines** | `flow_matching_action_head.py:190-195` | `flow_matching_action_head.py:185-189` |
+| **Layers** | 2 (`layer1`, `layer2`) | 3 (`W1`, `W2`, `W3`) |
+| **Timestep Input** | ❌ None | ✅ Sinusoidal positional encoding |
+| **Activation** | ReLU (after layer1) | Swish (after W2 only) |
+| **Input Dim** | `hidden_size=512` | `action_dim=32` |
+| **Output Dim** | `action_dim=32` | `hidden_size=1536` |
+| **Direction** | Embedding → Action space | Action space → Embedding |
+| **Parameters** | ~8.9M | ~228.2M |
+| **Purpose** | Decode DiT output to velocity predictions | Encode noisy actions + timestep to embeddings |
+
+**Why the Asymmetry?**
+
+- **Action Encoder is complex** because it must:
+  1. Encode timestep information (noise level awareness)
+  2. Project from low-dim (32) to high-dim (1536)
+  3. Fuse action + timestep via concatenation
+
+- **Action Decoder is simple** because:
+  1. No timestep needed (DiT already incorporated it via AdaLayerNorm)
+  2. Project from high-dim (512) to low-dim (32)
+  3. Straightforward dimensionality reduction
+
+---
+
+<a id="dit-architecture"></a>
+### Diffusion Transformer (DiT) Architecture
+
+The **Diffusion Transformer (DiT)** is the core generative model in GR00T N1.5's Flow Matching Action Head. It processes a heterogeneous sequence of state, future, and action tokens while cross-attending to vision-language features, conditioned on the denoising timestep via Adaptive Layer Normalization.
+
+This section provides a detailed explanation of the DiT architecture, including input construction, processing mechanics, output extraction, and a comparison with the original DiT paper (Peebles & Xie, 2023).
+
+**Cross-Reference**: For how the DiT fits into the training loop, see [Section 5: Training Data Flow and Flow Matching](#training-data-flow). For runtime behavior, see [Section 6: Diffusion Transformer (DiT)](#6-diffusion-transformer-dit).
+
+#### DiT Architecture Block Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUTS["📥 Input Construction"]
+        direction LR
+        STATE["state_features<br/>(B, 1, 1536)"]
+        FUTURE["future_tokens<br/>(B, 32, 1536)"]
+        ACTION["action_features<br/>(B, 16, 1536)"]
+    end
+
+    subgraph CONCAT["🔗 Sequence Assembly"]
+        CAT["torch.cat(dim=1)"]
+        SA["sa_embs<br/>(B, 49, 1536)"]
+    end
+
+    subgraph CONDITIONING["⏱️ Timestep Conditioning"]
+        T_IN["timestep<br/>(B,) ∈ [0,999]"]
+        SINCOS["Sinusoidal Encoding<br/>(B,) → (B, 256)"]
+        MLP_T["TimestepEmbedding MLP<br/>(B, 256) → (B, 512)"]
+        TEMB["temb<br/>(B, 512)"]
+    end
+
+    subgraph VL["🖼️ Vision-Language Context"]
+        VL_IN["vl_embs<br/>(B, seq, 1536)"]
+    end
+
+    subgraph TRANSFORMER["🔄 DiT Transformer (×12 blocks)"]
+        direction TB
+        subgraph EVEN["Even Blocks (0,2,4,6,8,10)"]
+            CROSS["Cross-Attention<br/>Q=sa_embs, K/V=vl_embs"]
+        end
+        subgraph ODD["Odd Blocks (1,3,5,7,9,11)"]
+            SELF["Self-Attention<br/>Q=K=V=sa_embs"]
+        end
+        subgraph SHARED["Per-Block Components"]
+            ADALN["AdaLayerNorm<br/>x = norm(x)·(1+scale) + shift"]
+            FF["FeedForward (GELU)"]
+        end
+    end
+
+    subgraph OUTPUT["📤 Output Extraction"]
+        NORM_OUT["norm_out + AdaLN(temb)"]
+        PROJ["proj_out_2<br/>Linear(512, output_dim)"]
+        MODEL_OUT["model_output<br/>(B, 49, output_dim)"]
+        DECODE["action_decoder<br/>CategorySpecificMLP"]
+        SLICE["pred[:, -16:]<br/>Extract action tokens"]
+        PRED["pred_actions<br/>(B, 16, 32)"]
+    end
+
+    STATE --> CAT
+    FUTURE --> CAT
+    ACTION --> CAT
+    CAT --> SA
+
+    T_IN --> SINCOS --> MLP_T --> TEMB
+
+    SA --> CROSS
+    VL_IN --> CROSS
+    CROSS --> SELF
+    TEMB --> ADALN
+    ADALN --> FF
+    SELF --> FF
+
+    FF --> NORM_OUT
+    TEMB --> NORM_OUT
+    NORM_OUT --> PROJ --> MODEL_OUT --> DECODE --> SLICE --> PRED
+
+    style INPUTS fill:#e1f5fe
+    style CONDITIONING fill:#fff3e0
+    style VL fill:#f3e5f5
+    style TRANSFORMER fill:#e8f5e9
+    style OUTPUT fill:#fce4ec
+```
+
+**Diagram Key**:
+- **Blue (Inputs)**: State, future tokens, and action features concatenated into `sa_embs`
+- **Orange (Conditioning)**: Timestep encoded via sinusoidal + MLP, modulates all AdaLayerNorm
+- **Purple (VL Context)**: Vision-language features from Eagle VLM, used as K/V in cross-attention
+- **Green (Transformer)**: 12 blocks alternating cross-attention (even) and self-attention (odd)
+- **Pink (Output)**: Final projection and slicing to extract 16-step action predictions
+
+#### Input Construction: The `sa_embs` Sequence
+
+The DiT receives a concatenated sequence `sa_embs` constructed as:
+
+```python
+# flow_matching_action_head.py, lines 320-322
+future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+# sa_embs shape: [B, 1 + 32 + 16, 1536] = [B, 49, 1536]
+```
+
+**Component Breakdown**:
+
+| Position | Component | Shape | Source | Role |
+|----------|-----------|-------|--------|------|
+| 0 | `state_features` | `[B, 1, 1536]` | `CategorySpecificMLP` | Current robot proprioceptive state (joint positions/velocities) |
+| 1-32 | `future_tokens` | `[B, 32, 1536]` | `nn.Embedding(32, 1536)` | Learnable latent placeholders for future planning |
+| 33-48 | `action_features` | `[B, 16, 1536]` | `MultiEmbodimentActionEncoder` | Noisy action trajectory with timestep conditioning |
+
+**Why This Specific Ordering?**
+
+1. **State First (Position 0)**: The current robot state provides the initial condition—the DiT needs to understand "where am I now?" before predicting "what should I do next?"
+
+2. **Future Tokens (Positions 1-32)**: These 32 learnable tokens act as a **latent bridge** between state and action:
+   - They allow the model to develop abstract internal representations for long-horizon planning
+   - Cross-attention to VL features can project task-relevant information into these slots
+   - **Important**: The config parameter `num_target_vision_tokens: int = 32` is misleadingly named—these are NOT vision token compressions, but learnable placeholders
+
+3. **Action Tokens (Positions 33-48)**: The noisy action trajectory represents the 16-step action chunk (frames t to t+15) that the model is learning to denoise
+
+**Sequence Length and Temporal Window**:
+
+| Metric | Value | Description |
+|--------|-------|-------------|
+| Total sequence length | 49 tokens | 1 state + 32 future + 16 action |
+| State temporal scope | Frame t | Current observation |
+| Action temporal scope | Frames t to t+15 | 16-step action horizon |
+| Future tokens | No explicit temporal assignment | Learned latent representations |
+
+**Concrete Example (Bread Dataset, B=1)**:
+```
+Input Components:
+  - state_features:  (1, 1, 1536)   [from CategorySpecificMLP, embodiment_id=31]
+  - future_tokens:   (1, 32, 1536)  [learnable, expanded from nn.Embedding(32, 1536)]
+  - action_features: (1, 16, 1536)  [from MultiEmbodimentActionEncoder, t_discretized=700]
+
+Concatenation:
+  sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+
+Output:
+  sa_embs: (1, 49, 1536)
+  └── Position 0:     state embedding (current joint positions)
+  └── Positions 1-32: future token embeddings (learnable)
+  └── Positions 33-48: action embeddings (noisy trajectory at t=0.7)
+```
+
+#### DiT Processing: Architecture Details
+
+The DiT is instantiated from configuration:
+
+```python
+# flow_matching_action_head.py, line 174
+self.model = DiT(**config.diffusion_model_cfg)
+```
+
+**Architecture Parameters**:
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `num_attention_heads` | 8 | Attention heads per layer |
+| `attention_head_dim` | 64 | Dimension per attention head |
+| `inner_dim` | 512 (8×64) | Total hidden dimension inside transformer |
+| `num_layers` | 12 | Number of transformer blocks |
+| `norm_type` | `"ada_norm"` | Adaptive Layer Normalization |
+| `interleave_self_attention` | configurable | Whether to alternate cross/self attention |
+| `cross_attention_dim` | 1536 | VL embedding dimension for K/V in cross-attention |
+| `num_embeds_ada_norm` | 1000 | Number of timestep buckets |
+
+**Code Reference**: `cross_attention_dit.py`, lines 191-211.
+
+**Cross-Reference**: For detailed processing mechanics (timestep conditioning, attention patterns, output extraction), see [Section 6: Diffusion Transformer (DiT)](#6-diffusion-transformer-dit).
+
+#### Comparison with Original DiT (Peebles & Xie, 2023)
+
+The GR00T N1.5 DiT differs significantly from the original Diffusion Transformer designed for image generation. Here's a concise comparison:
+
+**Architectural Comparison**:
+
+| Aspect | Original DiT (Image Generation) | GR00T N1.5 DiT (Action Prediction) |
+|--------|--------------------------------|-----------------------------------|
+| **Attention** | Self-attention only on image patches | Interleaved: even blocks = cross-attention to VL features, odd blocks = self-attention |
+| **Conditioning** | AdaLN-Zero: timestep + class label, with learnable α gating | AdaLayerNorm: timestep only (no gating), VL context via cross-attention |
+| **Input Tokens** | Homogeneous patchified image latents | Heterogeneous: [state(1), future(32), action(16)] tokens |
+| **Output** | Denoised image patches | Velocity predictions for action chunk |
+
+**Key Differences**:
+
+1. **Dual-Source Conditioning**: Original DiT conditions solely through AdaLN (timestep + class). GR00T uses **two conditioning pathways**: timestep via AdaLayerNorm, and visual-language context via explicit cross-attention blocks. This separates "when in denoising" from "what to do."
+
+2. **Simplified Normalization**: Original DiT's AdaLN-Zero includes a learnable gate α that scales residual contributions (initialized to zero for stable training). GR00T's AdaLayerNorm omits this gating:
+
+```python
+# Original DiT AdaLN-Zero
+x = x + α * attn(norm(x) * (1 + scale) + shift)
+
+# GR00T AdaLayerNorm
+x = attn(norm(x) * (1 + scale) + shift) + x  # No α gating
+```
+
+3. **Heterogeneous Sequence**: Image DiT processes uniform patches. GR00T's sequence contains semantically distinct regions—the model implicitly learns that position 0 is state, 1-32 are latent future slots, and 33-48 are actions to denoise.
+
+4. **Cross-Attention for Grounding**: The interleaved pattern enables action tokens to directly query visual features ("where is the bread?") while self-attention maintains temporal coherence across the 16-step action chunk.
+
+**Robotics-Specific Adaptations**:
+
+| Adaptation | Purpose |
+|------------|---------|
+| `CategorySpecificMLP` encoders/decoders | Embodiment-agnostic multi-robot training |
+| Future tokens (32 learnable) | Long-horizon planning abstractions |
+| Velocity prediction | Outputs velocity field rather than denoised samples |
+| Cross-attention to VL | Task grounding via vision-language features |
+
+**Code References**:
+
+| Component | File | Lines |
+|-----------|------|-------|
+| DiT class | `cross_attention_dit.py` | 187-301 |
+| TimestepEncoder | `cross_attention_dit.py` | 30-40 |
+| AdaLayerNorm | `cross_attention_dit.py` | 43-66 |
+| Input construction | `flow_matching_action_head.py` | 320-322 |
+| Output extraction | `flow_matching_action_head.py` | 333-334 |
+| Training forward | `flow_matching_action_head.py` | 266-343 |
+| Inference | `flow_matching_action_head.py` | 345-398 |
+
+---
+
+<a id="3-preprocessing-pipeline"></a>
+## 3. Preprocessing Pipeline
+
+The preprocessing pipeline transforms raw observations into the format expected by the Eagle VLM backbone. This stage uses callable `ProcessorStep` objects that implement `__call__()` methods.
+
+#### Data Flow Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUTS["📥 RAW INPUTS"]
+        I1["🖼️ Images (B, C, H, W)"]
+        I2["📝 Language (string)"]
+        I3["📊 State (B, D_state)"]
+        I4["🎯 Action (B, T, D_action)"]
+        I5["🤖 Embodiment (string tag)"]
+    end
+
+    subgraph PACK["GrootPackInputsStep.__call__()"]
+        P1["_to_uint8_np_bhwc()"]
+        P2["Stack cameras → (B,1,V,C,H,W)"]
+        P3["_min_max_norm() state"]
+        P4["Pad state → (B,1,64)"]
+        P5["_min_max_norm() action"]
+        P6["Pad action → (B,16,32)"]
+        P7["embodiment_mapping → id"]
+    end
+
+    subgraph ENCODE["GrootEagleEncodeStep.__call__()"]
+        E1["rearrange video"]
+        E2["Image.fromarray()"]
+        E3["apply_chat_template()"]
+        E4["process_vision_info()"]
+        E5["Store eagle_content"]
+    end
+
+    subgraph COLLATE["GrootEagleCollateStep.__call__()"]
+        C1["Gather text_list"]
+        C2["Gather image_inputs"]
+        C3["eagle_processor()"]
+        C4["eagle_pixel_values"]
+        C5["eagle_input_ids"]
+        C6["eagle_attention_mask"]
+    end
+
+    I1 --> P1 --> P2 --> E1
+    I3 --> P3 --> P4
+    I4 --> P5 --> P6
+    I5 --> P7
+    I2 --> E3
+    E1 --> E2 --> E3
+    E3 --> E4 --> E5
+    E5 --> C1 --> C3
+    E5 --> C2 --> C3
+    C3 --> C4 & C5 & C6
+```
+
+#### Function Call Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Input as Raw Inputs
+    participant Pack as GrootPackInputsStep
+    participant Encode as GrootEagleEncodeStep
+    participant Collate as GrootEagleCollateStep
+
+    Input->>Pack: images (B,C,H,W), state (B,D), action (B,T,D)
+    activate Pack
+    Pack->>Pack: _to_uint8_np_bhwc() → (B,H,W,C)
+    Pack->>Pack: video = stack + expand → (B,1,V,C,H,W)
+    Pack->>Pack: _min_max_norm(state) → [-1,1]
+    Pack->>Pack: pad → state (B,1,64), state_mask (B,1,64)
+    Pack->>Pack: _min_max_norm(action) → [-1,1]
+    Pack->>Pack: pad → action (B,16,32), action_mask (B,16,32)
+    Pack->>Pack: embodiment_mapping[tag] → embodiment_id (B,)
+    deactivate Pack
+
+    Pack->>Encode: video, language, state, action
+    activate Encode
+    Encode->>Encode: rearrange('t v c h w -> (t v) h w c')
+    Encode->>Encode: Image.fromarray() → List[PIL.Image]
+    Encode->>Encode: proc.apply_chat_template() → text_list
+    Encode->>Encode: proc.process_vision_info() → image_inputs
+    Encode->>Encode: Store eagle_content dict
+    deactivate Encode
+
+    Encode->>Collate: eagle_content per batch item
+    activate Collate
+    Collate->>Collate: Gather text_list, image_inputs
+    Collate->>Collate: eagle_processor(text, images)
+    Note right of Collate: eagle_pixel_values (B,tiles,3,448,448)<br/>eagle_input_ids (B,seq_len)<br/>eagle_attention_mask (B,seq_len)
+    deactivate Collate
+```
+
+The preprocessing pipeline performs three critical transformations:
+
+1. **Data Normalization**: State and action values are normalized to `[-1, 1]` using min-max normalization with dataset statistics. This ensures consistent input scales across different robot embodiments.
+
+2. **Vision Tokenization**: Camera images are converted to PIL format, processed through the Eagle processor's chat template, and tokenized into `eagle_pixel_values` tensors suitable for the SigLIP vision encoder.
+
+3. **Sequence Padding**: State vectors are padded to `max_state_dim=64` and action sequences to `max_action_dim=32` with `action_horizon=16` timesteps, enabling batch processing across different embodiments.
+
+### Input Packing (GrootPackInputsStep)
+
+**Function**: `GrootPackInputsStep.__call__()`
+
+Converts raw observations into normalized, padded tensors suitable for batching across different embodiments.
+
+| Input | Output |
+|-------|--------|
+| Images (B, C, H, W) | Video (B, 1, V, C, H, W) |
+| State (B, D) | State (B, 1, 64) + state_mask |
+| Action (B, T, D) | Action (B, 16, 32) + action_mask |
+| embodiment_tag (string) | embodiment_id (B,) |
+
+**Code Reference**: `processor_groot.py:GrootPackInputsStep.__call__()`
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - observation.images.wrist: (1, 3, 480, 640) float32
+  - observation.images.scene: (1, 3, 480, 640) float32
+  - observation.state: (1, 6) float32 [joint positions]
+  - action: (1, 6) float32 [target positions]
+  - embodiment_tag: "new_embodiment"
+
+Output:
+  - video: (1, 1, 2, 3, 480, 640) uint8 [2 cameras stacked]
+  - state: (1, 1, 64) float32 [padded, normalized to [-1,1]]
+  - state_mask: (1, 1, 64) bool [True for first 6 dims]
+  - action: (1, 16, 32) float32 [padded, normalized]
+  - action_mask: (1, 16, 32) bool [True for first 6 dims]
+  - embodiment_id: (1,) long [value: 31]
+```
+
+### Vision-Language Encoding (GrootEagleEncodeStep)
+
+**Function**: `GrootEagleEncodeStep.__call__()`
+
+Converts video frames to PIL images and applies the Eagle chat template to prepare vision-language inputs.
+
+| Input | Output |
+|-------|--------|
+| Video (B, 1, V, C, H, W) | image_inputs (List[PIL.Image]) |
+| Language (string) | text_list (List[str]) |
+
+**Code Reference**: `processor_groot.py:GrootEagleEncodeStep.__call__()`
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - video: (1, 1, 2, 3, 480, 640) [2 camera views]
+  - task: "Pick up the bread slice"
+
+Output:
+  - eagle_content dict containing:
+    - text_list: ["<image>...<image> Pick up the bread slice"]
+    - image_inputs: [PIL.Image(480,640), PIL.Image(480,640)]
+```
+
+### Tokenization and Batching (GrootEagleCollateStep)
+
+**Function**: `GrootEagleCollateStep.__call__()`
+
+Tokenizes text and processes images into tensors ready for the Eagle VLM backbone.
+
+| Input | Output |
+|-------|--------|
+| eagle_content dict | eagle_pixel_values (B, tiles, 3, 448, 448) |
+| | eagle_input_ids (B, seq_len) |
+| | eagle_attention_mask (B, seq_len) |
+
+**Code Reference**: `processor_groot.py:GrootEagleCollateStep.__call__()`
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - eagle_content from GrootEagleEncodeStep
+
+Output:
+  - eagle_pixel_values: (1, 2, 3, 448, 448) float32 [2 tiles]
+  - eagle_input_ids: (1, 156) long [tokenized prompt + image tokens]
+  - eagle_attention_mask: (1, 156) long
+```
+
+### Command-Line Interface Mapping
+
+| CLI Argument | Code Location | Effect |
+|--------------|---------------|--------|
+| `--embodiment-tag` | `GrootPackInputsStep.embodiment_tag` | Sets `embodiment_id` for CategorySpecificMLP routing |
+| `--data-config` | `GrootConfig.data_config` | Configures video keys and state/action dimensions |
+| `--normalize-min-max` | `GrootPackInputsStep.normalize_min_max` | Enables/disables min-max normalization |
+
+### Training vs. Inference Behavior
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| Action Input | Ground truth actions from dataset | None (actions generated by model) |
+| Normalization | Applied to both state and action | Applied to state only |
+| Action Mask | Used for loss computation | Not used |
+| Batch Size | Typically 16-128 | Typically 1 |
+
+**Cross-Reference**: The preprocessed `eagle_*` tensors are consumed by the Eagle VLM Backbone (Chapter 4).
+
+---
+
+<a id="4-eagle-vlm-backbone"></a>
+## 4. Eagle VLM Backbone
+
+The Eagle VLM backbone (System 2) processes vision and language inputs to produce contextualized embeddings for the action head. It uses Eagle-2.5 VLM architecture combining SigLIP-2 vision encoder with Qwen2 LLM.
+
+#### Function Call Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Collate as GrootEagleCollateStep
+    participant Backbone as EagleBackbone
+    participant Eagle as Eagle25VLForConditionalGeneration
+    participant SigLIP as SiglipVisionModel
+    participant Qwen as Qwen2ForCausalLM
+
+    Collate->>Backbone: eagle_* tensors
+    activate Backbone
+    Backbone->>Backbone: forward_eagle(): strip 'eagle_' prefix
+    Backbone->>Eagle: eagle_model(**input, output_hidden_states=True)
+    activate Eagle
+
+    Eagle->>SigLIP: pixel_values (B,tiles,3,448,448)
+    activate SigLIP
+    SigLIP->>SigLIP: vision_model() forward
+    SigLIP-->>Eagle: hidden_states[select_layer] (B,1024,1024)
+    deactivate SigLIP
+
+    Eagle->>Eagle: pixel_shuffle(scale=0.5) → (B,256,4096)
+    Eagle->>Eagle: mlp1() → vit_embeds (B,256,2048)
+    Eagle->>Eagle: input_embeds from input_ids (B,seq,2048)
+    Eagle->>Eagle: Replace image tokens with vit_embeds
+    Eagle->>Eagle: merged_embeds (B,total_seq,2048)
+
+    Eagle->>Qwen: merged_embeds + attention_mask
+    activate Qwen
+    Qwen->>Qwen: FlashAttention2 forward
+    Qwen-->>Eagle: output.hidden_states
+    deactivate Qwen
+
+    Eagle-->>Backbone: hidden_states[select_layer=-1] (B,seq,2048)
+    deactivate Eagle
+
+    Backbone->>Backbone: eagle_linear(2048→1536)
+    Note right of Backbone: backbone_features (B,seq,1536)<br/>backbone_attention_mask (B,seq)
+    deactivate Backbone
+```
+
+The Eagle backbone implements a vision-language model with three key components:
+
+1. **SigLIP Vision Encoder**: Processes images at 448×448 resolution using a Vision Transformer. The `select_layer` parameter (default: -1) extracts intermediate representations for better downstream performance.
+
+2. **Pixel Shuffle**: Reduces spatial dimensions by factor of 2 (1024→256 tokens) while increasing channel dimension (1024→4096), followed by MLP projection to LLM hidden size (2048).
+
+3. **Critical 2048→1536 Projection**: The `eagle_linear` layer bridges the Eagle VLM's 2048-dim output to the action head's 1536-dim input, enabling cross-attention in the DiT. See [Post-VLM Processing](#post-vlm-processing) for comprehensive details.
+
+### Command-Line Interface Mapping
+
+| CLI Argument | Code Location | Effect |
+|--------------|---------------|--------|
+| `--tune-llm` | `EagleBackbone.tune_llm` | Enables LLM fine-tuning |
+| `--tune-visual` | `EagleBackbone.tune_visual` | Enables vision encoder fine-tuning |
+| `--select-layer` | `EagleBackbone.select_layer` | Which LLM layer to extract features from |
+
+### Training vs. Inference Behavior
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| `tune_llm` | Configurable (default: False) | Always frozen |
+| `tune_visual` | Configurable (default: False) | Always frozen |
+| Gradient Flow | Through eagle_linear always | No gradients |
+| Frozen Module Mode | `set_frozen_modules_to_eval_mode()` called | N/A |
+
+**Cross-Reference**: The `backbone_features` output is consumed by the Action Head (Chapter 5).
+
+<a id="eagle-forward-method"></a>
+### Eagle25VLForConditionalGeneration.forward() Deep Dive
+
+The `forward()` method in `Eagle25VLForConditionalGeneration` is the core of the Eagle VLM. It performs **multimodal fusion** by encoding text tokens, extracting visual features, replacing placeholder tokens with vision embeddings, and processing the fused sequence through the language model.
+
+#### Method Signature and Parameters
+
+```python
+# File: modeling_eagle2_5_vl.py
+def forward(
+    self,
+    pixel_values: torch.FloatTensor,
+    input_ids: torch.LongTensor = None,
+    attention_mask: torch.Tensor | None = None,
+    ...
+) -> tuple | CausalLMOutputWithPast:
+```
+
+| Parameter | Type | Shape | Description |
+|-----------|------|-------|-------------|
+| `pixel_values` | `torch.FloatTensor` | `[B*N_img, C, H, W]` | Preprocessed image tensors |
+| `input_ids` | `torch.LongTensor` | `[B, seq_len]` | Tokenized text with `<image>` placeholder tokens |
+| `attention_mask` | `torch.Tensor` | `[B, seq_len]` | Mask: valid tokens (1) vs. padding (0) |
+| `image_flags` | `torch.LongTensor` | `[B, N_img]` | Valid images (1) vs. padded (0) |
+| `labels` | `torch.LongTensor` | `[B, seq_len]` | Target token IDs for cross-entropy loss (**NOT used in robotic training**) |
+| `output_hidden_states` | `bool` | - | Whether to return all layer hidden states (**True for GR00T**) |
+
+#### Forward Pass Data Flow
+
+```mermaid
+flowchart TB
+    subgraph INPUTS["📥 Forward Inputs"]
+        PV["pixel_values<br/>[B, 3, 224, 224]"]
+        IDS["input_ids<br/>[B, seq_len]"]
+        MASK["attention_mask<br/>[B, seq_len]"]
+    end
+
+    subgraph TEXT["📝 Text Embedding"]
+        EMB["language_model.get_input_embeddings()"]
+        IE["input_embeds<br/>[B, seq_len, 2048]"]
+    end
+
+    subgraph VISION["🔍 Vision Encoding Pipeline"]
+        VIT["SigLIP ViT Encoder"]
+        VE1["vit_embeds<br/>[B, 256, 1152]"]
+        PS["pixel_shuffle(0.5)"]
+        VE2["[B, 64, 4608]"]
+        MLP["mlp1() Connector"]
+        VE3["vit_embeds<br/>[B, 64, 2048]"]
+    end
+
+    subgraph FUSION["🔗 Multimodal Token Fusion"]
+        FLAT["Flatten: [B*seq_len, 2048]"]
+        SEL["selected = input_ids == image_token_index"]
+        REPLACE["input_embeds[selected] = vit_embeds"]
+        RESHAPE["Reshape: [B, seq_len, 2048]"]
+    end
+
+    subgraph LLM["🧠 Qwen3 Language Model"]
+        Q3["Qwen3ForCausalLM<br/>(12 layers active)"]
+        HS["hidden_states<br/>[B, seq_len, 2048]"]
+        LOGITS["logits<br/>[B, seq_len, vocab_size]"]
+    end
+
+    subgraph OUTPUT["📤 Outputs"]
+        OUT["CausalLMOutputWithPast"]
+        LOSS["loss (None for robotic training)"]
+        HIDDEN["hidden_states → to action head"]
+    end
+
+    PV --> VIT --> VE1 --> PS --> VE2 --> MLP --> VE3
+    IDS --> EMB --> IE --> FLAT
+    VE3 --> REPLACE
+    FLAT --> SEL --> REPLACE --> RESHAPE
+    RESHAPE --> Q3
+    MASK --> Q3
+    Q3 --> HS --> OUT
+    Q3 --> LOGITS --> OUT
+    OUT --> LOSS
+    OUT --> HIDDEN
+```
+
+#### Step 1: Text Embedding Extraction
+
+```python
+# File: modeling_eagle2_5_vl.py
+input_embeds = self.language_model.get_input_embeddings()(input_ids)
+```
+
+The token embedding layer converts `input_ids` to dense embeddings. At this stage, `<image>` placeholder tokens (ID `151655`) are also embedded—but will be **replaced** with vision features later.
+
+**Tensor transformation**: `[B, seq_len]` → `[B, seq_len, 2048]`
+
+#### Step 2: Vision Feature Extraction
+
+```python
+# File: modeling_eagle2_5_vl.py
+vit_embeds = self.extract_feature(pixel_values)
+```
+
+The `extract_feature()` method performs the complete vision encoding pipeline:
+
+1. **SigLIP ViT forward pass**: `[B, 3, 224, 224]` → `[B, 256, 1152]`
+2. **Pixel shuffle** (spatial downsampling): `[B, 256, 1152]` → `[B, 64, 4608]`
+3. **MLP connector projection**: `[B, 64, 4608]` → `[B, 64, 2048]`
+
+```python
+# File: modeling_eagle2_5_vl.py
+def pixel_shuffle(self, x, scale_factor=0.5):
+    n, w, h, c = x.size()
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    x = x.permute(0, 2, 1, 3).contiguous()
+    ...
+```
+
+#### Step 3: Multimodal Token Fusion (Core Algorithm)
+
+This is the **most critical section**—where vision and text are merged:
+
+```python
+# File: modeling_eagle2_5_vl.py
+b, n, c = input_embeds.shape
+input_embeds = input_embeds.reshape(b * n, c)
+input_ids = input_ids.reshape(b * n)
+selected = input_ids == self.image_token_index
+input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, c)
+```
+
+**The `* 0.0 +` trick**: This gradient-preserving technique zeros out placeholder embeddings while keeping the computation graph intact, then inserts actual vision features.
+
+```
+Before fusion: [<text> <text> <IMG> <IMG> ... <IMG> <text>]
+                             ↑   64 placeholder tokens   ↑
+After fusion:  [<text> <text> <VIS> <VIS> ... <VIS> <text>]
+                             ↑ 64 vision embeddings ↑
+```
+
+#### Step 4: Language Model Processing
+
+```python
+# File: modeling_eagle2_5_vl.py
+outputs = self.language_model(
+    inputs_embeds=input_embeds,
+    attention_mask=attention_mask,
+    output_hidden_states=output_hidden_states,
+)
+logits = outputs.logits
+```
+
+The fused multimodal embeddings pass through Qwen3. For GR00T, `output_hidden_states=True` is critical—the action head needs `hidden_states` from a specific layer.
+
+#### Step 5: Loss Computation (Conditional)
+
+```python
+# File: modeling_eagle2_5_vl.py
+loss = None
+if labels is not None:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_fct = CrossEntropyLoss()
+    loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+```
+
+```mermaid
+flowchart TD
+    subgraph LOSS_DECISION["Loss Computation Logic"]
+        CHECK{"labels is not None?"}
+        YES["Compute CrossEntropyLoss<br/>(next-token prediction)"]
+        NO["loss = None<br/>(skip VLM loss)"]
+    end
+
+    CHECK -->|"Training with labels<br/>(text generation)"| YES
+    CHECK -->|"Robotic fine-tuning<br/>(no labels passed)"| NO
+
+    style NO fill:#90EE90
+    style YES fill:#FFB6C1
+```
+
+> **⚠️ Critical for Robotic Training**: During GR00T fine-tuning for manipulation tasks, `labels` is **NOT passed** to the Eagle VLM. The VLM acts purely as a **feature extractor**, and only the **flow matching loss from the DiT action head** is used for training.
+
+<a id="vlm-as-feature-extractor"></a>
+### VLM as Feature Extractor (No Labels During Robotic Training)
+
+In GR00T's robotic fine-tuning pipeline, the Eagle VLM does **not** compute cross-entropy loss. The `forward_eagle()` method in `EagleBackbone` shows that no `labels` parameter is passed:
+
+```python
+# File: groot_n1.py
+def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
+    eagle_input = {k.removeprefix("eagle_"): v for k, v in vl_input.items() ...}
+    eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+    eagle_features = eagle_output.hidden_states[self.select_layer]
+    eagle_features = self.eagle_linear(eagle_features)
+    return eagle_features, eagle_input["attention_mask"]
+```
+
+Note that `eagle_input` contains only `pixel_values`, `input_ids`, `attention_mask`, and `image_flags`—**no `labels`**. The VLM's `loss` output is always `None` during robotic training.
+
+#### Where the Actual Training Loss Comes From
+
+The **only loss** used during GR00T fine-tuning is the **flow matching MSE loss** from the DiT action head:
+
+```python
+# File: flow_matching_action_head.py
+velocity = actions - noise  # Target: direction from noise to action
+pred_actions = pred[:, -actions.shape[1]:]
+loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+loss = loss.sum() / action_mask.sum()
+```
+
+```mermaid
+flowchart LR
+    subgraph VLM["Eagle VLM (Feature Extractor)"]
+        V1["pixel_values + input_ids"]
+        V2["forward()"]
+        V3["hidden_states"]
+        V4["loss = None ❌"]
+    end
+
+    subgraph ACTION["DiT Action Head (Loss Computation)"]
+        A1["backbone_features"]
+        A2["flow matching forward()"]
+        A3["pred_actions"]
+        A4["loss = MSE ✅"]
+    end
+
+    V1 --> V2 --> V3 --> A1
+    V2 -.-> V4
+    A1 --> A2 --> A3 --> A4
+
+    style V4 fill:#FFB6C1,stroke:#FF0000
+    style A4 fill:#90EE90,stroke:#00FF00
+```
+
+#### Training Data Flow Summary
+
+| Stage | Component | Loss Used | Purpose |
+|-------|-----------|-----------|---------|
+| 1. Vision-Language | Eagle VLM `forward()` | ❌ None | Feature extraction only |
+| 2. Feature Projection | `eagle_linear` | ❌ None | Dimension adaptation (2048→1536) |
+| 3. Action Prediction | DiT `forward()` | ✅ Flow Matching MSE | Denoise actions from noise to target |
+
+This design allows the pretrained VLM knowledge to be preserved while adapting only the action prediction pathway for robotic manipulation.
+
+<a id="post-vlm-processing"></a>
+### Post-VLM Processing: Dimension Projection
+
+After the Eagle VLM extracts hidden states, the `eagle_linear` layer projects the features from VLM dimension to the action head's expected dimension. This layer is the **architectural bridge** between the Eagle VLM and the DiT action head.
+
+> **Cross-Reference**: After `eagle_linear` projection, the features are further processed by `vlln` and `vl_self_attention` layers in the Action Head. See [Section 5: VL Feature Refinement](#vl-feature-refinement) for comprehensive documentation of those layers.
+
+#### Data Flow Overview
+
+```mermaid
+flowchart LR
+    subgraph EAGLE["Eagle VLM"]
+        A["pixel_values + input_ids"]
+        B["forward()"]
+        C["hidden_states<br/>[B, seq, 2048]"]
+    end
+
+    subgraph PROJ["EagleBackbone"]
+        D["eagle_linear<br/>Linear(2048, 1536)"]
+        E["backbone_features<br/>[B, seq, 1536]"]
+    end
+
+    subgraph SECTION5["Section 5: Action Head"]
+        F["vlln + vl_self_attention"]
+        G["DiT cross-attention"]
+    end
+
+    A --> B --> C --> D --> E --> F --> G
+
+    style D fill:#FFE4B5
+```
+
+#### eagle_linear: Dimension Projection Layer
+
+**Purpose**: The `eagle_linear` layer is the **architectural bridge** between two components with different hidden dimensions:
+
+| Component | Hidden Dimension | Source |
+|-----------|------------------|--------|
+| Eagle VLM (Qwen3 LLM) | **2048** | Fixed by pretrained VLM architecture |
+| DiT Action Head | **1536** | Fixed by pretrained action head (`backbone_embedding_dim`) |
+
+**Position in Forward Pass**: `eagle_linear` is **NOT** part of the Eagle VLM's `forward()` method—it is defined and applied **separately** in `EagleBackbone` after VLM processing completes.
+
+**Initialization** (`groot_n1.py`, lines 87-90):
+
+```python
+# File: groot_n1.py
+if project_to_dim is not None:
+    self.eagle_linear = torch.nn.Linear(2048, project_to_dim)  # project_to_dim = 1536
+else:
+    self.eagle_linear = torch.nn.Identity()
+```
+
+**Application** (`groot_n1.py`, lines 134-145):
+
+```python
+# File: groot_n1.py
+def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
+    eagle_prefix = "eagle_"
+    eagle_input = {
+        k.removeprefix(eagle_prefix): v for k, v in vl_input.items() if k.startswith(eagle_prefix)
+    }
+    del eagle_input["image_sizes"]
+
+    eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+    eagle_features = eagle_output.hidden_states[self.select_layer]
+
+    eagle_features = self.eagle_linear(eagle_features)  # <-- Projection applied HERE
+    return eagle_features, eagle_input["attention_mask"]
+```
+
+**Input/Output Tensor Shapes**:
+
+| Direction | Shape | Description |
+|-----------|-------|-------------|
+| **Input** | `[B, seq_len, 2048]` | Hidden states from Qwen3 LLM (extracted at `select_layer`) |
+| **Output** | `[B, seq_len, 1536]` | Projected features matching DiT action head's expected dimension |
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:  [1, 668, 2048]  (668 = 156 text tokens + 512 vision tokens)
+Output: [1, 668, 1536]  (sequence length preserved, dimension reduced)
+```
+
+**Timing Relative to VLM Processing**:
+
+```
+Timeline:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Eagle VLM forward()                                                         │
+│  ├── Text Embedding: input_ids → [B, seq, 2048]                            │
+│  ├── Vision Encoding: pixel_values → vit_embeds [B, 64, 2048]              │
+│  ├── Multimodal Fusion: Replace <image> tokens with vision embeddings      │
+│  └── Qwen3 LLM: merged_embeds → hidden_states [B, seq, 2048]               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────▼───────────────┐
+                    │ Extract hidden_states[layer]  │
+                    │       [B, seq, 2048]          │
+                    └───────────────┬───────────────┘
+                                    │
+                    ┌───────────────▼───────────────┐
+                    │     eagle_linear()            │  ◄── PROJECTION HAPPENS HERE
+                    │ nn.Linear(2048, 1536)         │
+                    │       [B, seq, 1536]          │
+                    └───────────────┬───────────────┘
+                                    │
+                    ┌───────────────▼───────────────┐
+                    │     backbone_features         │
+                    │       [B, seq, 1536]          │
+                    └───────────────────────────────┘
+```
+
+#### Section 4 Pipeline Summary
+
+| Stage | Layer | Input Shape | Output Shape | Location |
+|-------|-------|-------------|--------------|----------|
+| 1 | Eagle VLM `forward()` | pixel_values, input_ids | `[B, seq, 2048]` | `modeling_eagle2_5_vl.py` |
+| 2 | `eagle_linear` | `[B, seq, 2048]` | `[B, seq, 1536]` | `groot_n1.py:144` |
+
+The `backbone_features` output is then passed to the Action Head (Section 5), where `vlln` and `vl_self_attention` layers further refine the features before DiT cross-attention.
+
+---
+
+<a id="5-action-head-processing"></a>
+## 5. Action Head Processing
+
+The Action Head (System 1) encodes state and action information, constructs the input sequence for the DiT, and manages the flow matching training objective.
+
+#### Data Flow Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📥 Inputs"]
+        B1["backbone_features<br/>(B, seq, 1536)"]
+        S1["state<br/>(B, 1, 64)"]
+        A1["action<br/>(B, 16, 32)"]
+        E1["embodiment_id<br/>(B,)"]
+    end
+
+    subgraph VL_PROC["VL Processing"]
+        VL1["vl_layernorm()"]
+        VL2["vl_self_attention()"]
+        VL3["vl_embs<br/>(B, seq, 1536)"]
+    end
+
+    subgraph STATE["State Encoding"]
+        SE1["state_encoder()<br/>CategorySpecificMLP"]
+        SE2["state_features<br/>(B, 1, 1536)"]
+    end
+
+    subgraph ACTION["Action Encoding"]
+        AE1["Sample noise ~ N(0,1)"]
+        AE2["Sample t ~ Beta(1.5, 1.0)"]
+        AE3["noisy = (1-t)*noise + t*action"]
+        AE4["action_encoder()<br/>MultiEmbodimentActionEncoder"]
+        AE5["action_features<br/>(B, 16, 1536)"]
+    end
+
+    subgraph SEQ["Sequence Construction"]
+        F1["future_tokens.weight<br/>(32, 1536)"]
+        F2["Expand → (B, 32, 1536)"]
+        C1["torch.cat(dim=1)"]
+        C2["sa_embs<br/>(B, 49, 1536)"]
+    end
+
+    B1 --> VL1 --> VL2 --> VL3
+    S1 --> SE1 --> SE2
+    A1 --> AE1 --> AE3
+    AE2 --> AE3 --> AE4 --> AE5
+    E1 --> SE1 & AE4
+    SE2 --> C1
+    F1 --> F2 --> C1
+    AE5 --> C1 --> C2
+```
+
+#### Function Call Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Backbone as EagleBackbone
+    participant ActionHead as FlowmatchingActionHead
+    participant DiT as DiT
+
+    Backbone->>ActionHead: backbone_features (B,seq,1536)
+    activate ActionHead
+    ActionHead->>ActionHead: vl_layernorm()
+    ActionHead->>ActionHead: vl_self_attention() → vl_embs (B,seq,1536)
+
+    ActionHead->>ActionHead: state_encoder(state, emb_id)
+    Note right of ActionHead: CategorySpecificMLP<br/>(B,1,64) → (B,1,1536)
+
+    ActionHead->>ActionHead: noise = randn(B,16,32)
+    ActionHead->>ActionHead: t ~ Beta(1.5, 1.0)
+    ActionHead->>ActionHead: noisy = (1-t)*noise + t*action
+    ActionHead->>ActionHead: velocity = action - noise (TARGET)
+    ActionHead->>ActionHead: t_discretized = (t * 1000).long()
+
+    ActionHead->>ActionHead: action_encoder(noisy, t_disc, emb_id)
+    Note right of ActionHead: MultiEmbodimentActionEncoder<br/>(B,16,32) → (B,16,1536)
+
+    ActionHead->>ActionHead: future_tokens.expand(B,32,1536)
+    ActionHead->>ActionHead: sa_embs = cat([state,future,action],dim=1)
+    Note right of ActionHead: sa_embs (B, 1+32+16, 1536) = (B,49,1536)
+
+    ActionHead->>DiT: hidden_states=sa_embs, encoder_hidden_states=vl_embs, timestep=t_disc
+    deactivate ActionHead
+```
+
+The action head implements flow matching for action generation:
+
+1. **State Encoder**: A `CategorySpecificMLP` projects state vectors to the embedding dimension. Each embodiment has its own MLP weights (indexed by `embodiment_id`).
+
+2. **Action Encoder**: The `MultiEmbodimentActionEncoder` combines action embeddings with sinusoidal timestep encoding, enabling the model to learn the denoising process.
+
+3. **Future Tokens**: Learnable embeddings (32 tokens) provide additional capacity for the model to reason about future actions.
+
+4. **Sequence Construction**: State (1 token) + future tokens (32) + action (16 tokens) = 49 total tokens in `sa_embs`.
+
+<a id="vl-feature-refinement"></a>
+### VL Feature Refinement: vlln and vl_self_attention
+
+After receiving `backbone_features` from the Eagle VLM backbone (via `eagle_linear` projection), the Action Head applies two layers to refine the vision-language features before they are used as cross-attention conditioning in the DiT.
+
+#### Data Flow in Action Head
+
+```mermaid
+flowchart LR
+    subgraph INPUT["From EagleBackbone"]
+        A["backbone_features<br/>[B, seq, 1536]"]
+    end
+
+    subgraph REFINE["FlowMatchingActionHead.process_backbone_output()"]
+        B["vlln<br/>LayerNorm(1536)"]
+        C["vl_self_attention<br/>SelfAttentionTransformer"]
+        D["refined features<br/>[B, seq, 1536]"]
+    end
+
+    subgraph DIT["DiT Cross-Attention"]
+        E["encoder_hidden_states=vl_embs"]
+        F["action predictions"]
+    end
+
+    A --> B --> C --> D --> E --> F
+
+    style B fill:#87CEEB
+    style C fill:#98FB98
+```
+
+#### 1. vlln: Layer Normalization
+
+**Purpose**: Normalizes the backbone features before self-attention processing.
+
+**Initialization** (`flow_matching_action_head.py`, lines 199):
+
+```python
+# File: flow_matching_action_head.py
+self.vlln = nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
+```
+
+| Input Shape | Output Shape | Description |
+|-------------|--------------|-------------|
+| `[B, seq_len, 1536]` | `[B, seq_len, 1536]` | Normalized features (same shape) |
+
+#### 2. vl_self_attention: Feature Refinement Layer
+
+**Important Clarification**: The `vl_self_attention` layer does **NOT** compress or reduce the sequence length. It performs **feature refinement** through self-attention while preserving all tokens.
+
+**Input/Output Shapes** (sequence length unchanged):
+
+| Stage | Tensor Shape | Description |
+|-------|--------------|-------------|
+| **Input** | `[B, seq_len, 1536]` | Output from `vlln` |
+| **Output** | `[B, seq_len, 1536]` | **Same shape** - refined through self-attention |
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:  [1, 668, 1536]  (668 = 156 text tokens + 512 vision tokens)
+Output: [1, 668, 1536]  (sequence length PRESERVED)
+```
+
+**Architecture**: The `vl_self_attention` is a `SelfAttentionTransformer` from `cross_attention_dit.py`:
+
+```python
+# File: cross_attention_dit.py (lines 304-347)
+class SelfAttentionTransformer(ModelMixin, ConfigMixin):
     def __init__(
         self,
-        tune_llm: bool = False,
-        tune_visual: bool = False,
-        select_layer: int = -1,  # Middle-layer extraction
-        project_to_dim: int = 1536,
+        num_attention_heads: int = 8,
+        attention_head_dim: int = 64,      # inner_dim = 8 × 64 = 512
+        num_layers: int = 12,               # 12 transformer blocks
+        dropout: float = 0.1,
+        activation_fn: str = "gelu-approximate",
+        positional_embeddings: str | None = "sinusoidal",
+        max_num_positional_embeddings: int = 512,
         ...
     ):
-        # Load Eagle-2 VLM
-        config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
-
-        # Projection layer (2048 → 1536)
-        self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
-
-        # Remove layers after select_layer for efficiency
-        while len(self.eagle_model.language_model.model.layers) > select_layer:
-            self.eagle_model.language_model.model.layers.pop(-1)
+        self.inner_dim = num_attention_heads * attention_head_dim  # 512
+        self.transformer_blocks = nn.ModuleList([
+            BasicTransformerBlock(self.inner_dim, ...)
+            for _ in range(num_layers)  # 12 blocks
+        ])
 ```
 
-> "We found that using middle-layer instead of final-layer LLM embeddings resulted in both faster inference speed and higher downstream policy success rate. For GR00T-N1-2B, we use the representations from the 12th layer."
-> — *GR00T N1.5 White Paper*
+**Forward Pass** (sequence dimension preserved):
 
-<a id="diffusion-transformer-action-head"></a>
-### Diffusion Transformer Action Head
-
-> "For modeling actions, GR00T N1 uses a variant of DiT (Diffusion Transformer), which is a transformer with denoising step conditioning via adaptive layer normalization... V_θ consists of alternating cross-attention and self-attention blocks."
-> — *GR00T N1.5 White Paper, Section 2.1*
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Denoising steps (K) | 4 | Forward Euler integration steps |
-| Action horizon (H) | 16 | Timesteps per action chunk |
-| DiT hidden size | 1024 | Transformer hidden dimension |
-| DiT layers | 12 | Number of transformer layers |
-| Attention heads | 8 | Number of attention heads |
-
-**Flow Matching Loss** (White Paper Equation 1):
-```
-L_fm(θ) = E_τ[||V_θ(φ_t, A_t^τ, q_t) − (ε−A_t)||²]
-```
-
-**Implementation** (`gr00t/model/action_head/flow_matching_action_head.py`):
 ```python
-def forward(self, backbone_output: BatchFeature, action_input: BatchFeature):
-    actions = action_input.action
+# File: cross_attention_dit.py (lines 353-370)
+def forward(
+    self,
+    hidden_states: torch.Tensor,  # Shape: (B, T, D)
+    return_all_hidden_states: bool = False,
+):
+    hidden_states = hidden_states.contiguous()
+    for _idx, block in enumerate(self.transformer_blocks):
+        hidden_states = block(hidden_states)  # Same shape in, same shape out
+    return hidden_states  # Shape unchanged: (B, T, D)
+```
+
+**Configuration Parameters** (`vl_self_attention_cfg`):
+
+| Parameter | Typical Value | Description |
+|-----------|---------------|-------------|
+| `num_attention_heads` | 8 | Number of attention heads |
+| `attention_head_dim` | 64 | Dimension per head (inner_dim = 8 × 64 = 512) |
+| `num_layers` | 12 | Number of transformer blocks |
+| `dropout` | 0.1 | Dropout rate |
+| `positional_embeddings` | "sinusoidal" | Position encoding type |
+| `max_num_positional_embeddings` | 512 | Maximum sequence length for position encoding |
+| `activation_fn` | "gelu-approximate" | Activation function |
+
+**Instantiation** (`flow_matching_action_head.py`, lines 199-202):
+
+```python
+# File: flow_matching_action_head.py
+self.vlln = nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
+self.vl_self_attention = (
+    SelfAttentionTransformer(**config.vl_self_attention_cfg) if config.use_vlln else nn.Identity()
+)
+```
+
+**Usage in `process_backbone_output()`** (`flow_matching_action_head.py`, lines 259-264):
+
+```python
+# File: flow_matching_action_head.py
+def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+    backbone_features = backbone_output["backbone_features"]  # [B, seq, 1536]
+    backbone_features = self.vlln(backbone_features)          # LayerNorm
+    backbone_features = self.vl_self_attention(backbone_features)  # Self-attention refinement
+    backbone_output["backbone_features"] = backbone_features
+    return backbone_output
+```
+
+#### Purpose of vl_self_attention
+
+1. **Cross-Token Reasoning**: Allows vision tokens to attend to language tokens and vice versa, enabling:
+   - Understanding spatial relationships ("the bread is **on** the table")
+   - Correlating objects across different image regions
+
+2. **Feature Refinement**: The VLM's hidden states are optimized for language generation, not action prediction. Self-attention adapts these representations for robotic control.
+
+3. **Temporal Coherence**: Sinusoidal positional embeddings help the model understand token ordering, critical for sequential action prediction.
+
+4. **Conditioning Preparation**: Refines `vl_embs` before they serve as **cross-attention conditioning** in the DiT:
+
+```python
+# File: flow_matching_action_head.py (lines 326-332)
+model_output = self.model(
+    hidden_states=sa_embs,                     # State + Future + Action tokens
+    encoder_hidden_states=vl_embs,             # ← vl_self_attention output used here
+    encoder_attention_mask=vl_attn_mask,
+    timestep=t_discretized,
+)
+```
+
+#### Complete VL Processing Pipeline Summary
+
+| Stage | Layer | Input Shape | Output Shape | Location |
+|-------|-------|-------------|--------------|----------|
+| 1 | Eagle VLM `forward()` | pixel_values, input_ids | `[B, seq, 2048]` | `modeling_eagle2_5_vl.py` |
+| 2 | `eagle_linear` | `[B, seq, 2048]` | `[B, seq, 1536]` | `groot_n1.py:144` (Section 4) |
+| 3 | `vlln` (LayerNorm) | `[B, seq, 1536]` | `[B, seq, 1536]` | `flow_matching_action_head.py:261` |
+| 4 | `vl_self_attention` | `[B, seq, 1536]` | `[B, seq, 1536]` | `flow_matching_action_head.py:262` |
+| 5 | DiT cross-attention | `vl_embs` as KV | action predictions | `flow_matching_action_head.py:326` |
+
+**Note on `num_target_vision_tokens`**: The config parameter `num_target_vision_tokens: int = 32` is used for `future_tokens` (learnable tokens added to the DiT's input sequence), NOT for compressing VL features. These appear in the DiT input:
+
+```python
+future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+```
+
+<a id="state-encoding"></a>
+### State Encoding: Forward Pass Details
+
+The State Encoder converts robot proprioceptive state (joint positions, velocities) into the DiT embedding space. This section details the forward pass mechanics.
+
+**Cross-Reference**: For architecture details of the `CategorySpecificMLP` class, weight bank shapes, and training behavior, see [Section 2: State Encoder](#state-encoder).
+
+#### Forward Method Signature
+
+```python
+class CategorySpecificMLP(nn.Module):
+    def forward(self, x, cat_ids):
+        """
+        Args:
+            x:       shape (B, 1, max_state_dim)  # Padded proprioceptive state
+            cat_ids: shape (B,)                   # Embodiment IDs for weight bank indexing
+
+        Returns:
+            state_features: shape (B, 1, hidden_size)  # (B, 1, 1536)
+        """
+```
+
+#### Step-by-Step Forward Pass
+
+**Code Implementation** (`flow_matching_action_head.py`, lines 56-65):
+
+```python
+class CategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.num_categories = num_categories
+        # layer1: (max_state_dim → hidden_size) = (64 → 1024)
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        # layer2: (hidden_size → output_dim) = (1024 → 1536)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x, cat_ids):
+        # Step 1: W1 projection
+        hidden = self.layer1(x, cat_ids)    # (B, 1, 64) → (B, 1, 1024)
+
+        # Step 2: ReLU activation
+        hidden = F.relu(hidden)              # (B, 1, 1024) → (B, 1, 1024)
+
+        # Step 3: W2 projection (no activation)
+        output = self.layer2(hidden, cat_ids)  # (B, 1, 1024) → (B, 1, 1536)
+        return output
+```
+
+| Step | Operation | Input Shape | Output Shape | Description |
+|------|-----------|-------------|--------------|-------------|
+| 1 | `layer1(x, cat_ids)` | `(B, 1, 64)` | `(B, 1, 1024)` | Project state to hidden dimension |
+| 2 | `F.relu()` | `(B, 1, 1024)` | `(B, 1, 1024)` | Non-linearity |
+| 3 | `layer2(hidden, cat_ids)` | `(B, 1, 1024)` | `(B, 1, 1536)` | Project to DiT embedding dimension |
+
+#### Weight Bank Indexing
+
+Each `CategorySpecificLinear` layer maintains a weight bank for all 32 embodiments. The `cat_ids` tensor selects embodiment-specific weights:
+
+**Code Implementation** (`flow_matching_action_head.py`, lines 42-53):
+
+```python
+class CategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories, input_dim, hidden_dim):
+        super().__init__()
+        # Weight bank: separate weights for each embodiment
+        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+    def forward(self, x, cat_ids):
+        # Select weights for each batch item's embodiment
+        selected_w = self.W[cat_ids]   # (B,) → (B, input_dim, hidden_dim)
+        selected_b = self.b[cat_ids]   # (B,) → (B, hidden_dim)
+
+        # Batched matrix multiply: (B, 1, in) × (B, in, out) → (B, 1, out)
+        return torch.bmm(x, selected_w) + selected_b.unsqueeze(1)
+```
+
+**Indexing Example**:
+```python
+# For SO-101 robot (embodiment_id = 31):
+cat_ids = torch.tensor([31])
+
+# layer1.W shape: [32, 64, 1024] (all embodiments)
+# selected_w = layer1.W[cat_ids]  → [1, 64, 1024] (just SO-101's weights)
+
+# layer2.W shape: [32, 1024, 1536] (all embodiments)
+# selected_w = layer2.W[cat_ids]  → [1, 1024, 1536] (just SO-101's weights)
+```
+
+#### Concrete Example (Bread Dataset with SO-101)
+
+```
+Input:
+  - state: (1, 1, 64)      [6 joints padded to 64]
+  - cat_ids: (1,) = [31]   [SO-101 embodiment ID]
+
+Step 1: layer1 (W1 projection)
+  - Select weights: W1[31, 64, 1024], b1[31, 1024]
+  - Compute: (1, 1, 64) × (1, 64, 1024) + (1, 1, 1024)
+  - hidden: (1, 1, 1024)
+
+Step 2: ReLU activation
+  - F.relu(hidden)
+  - hidden: (1, 1, 1024)
+
+Step 3: layer2 (W2 projection)
+  - Select weights: W2[31, 1024, 1536], b2[31, 1536]
+  - Compute: (1, 1, 1024) × (1, 1024, 1536) + (1, 1, 1536)
+  - output: (1, 1, 1536)
+
+Output:
+  - state_features: (1, 1, 1536)
+```
+
+#### Tensor Shape Transformation Summary
+
+| Stage | Tensor | Shape | Notes |
+|-------|--------|-------|-------|
+| Input | `state` | `[B, 1, 64]` | 6 real joints + 58 zeros padding |
+| Input | `cat_ids` | `[B]` | Embodiment ID (e.g., 31 for SO-101) |
+| After layer1 | `hidden` | `[B, 1, 1024]` | Linear projection |
+| After ReLU | `hidden` | `[B, 1, 1024]` | Non-linearity applied |
+| After layer2 | `output` | `[B, 1, 1536]` | Final state features |
+
+#### Code Reference: Where State Encoding is Called
+
+**Training** (`forward()`, line 299):
+```python
+# Get embodiment ID.
+embodiment_id = action_input.embodiment_id
+
+# Embed state.
+state_features = self.state_encoder(action_input.state, embodiment_id)
+```
+
+**Inference** (`get_action()`, line 354):
+```python
+embodiment_id = action_input.embodiment_id
+
+# Embed state.
+state_features = self.state_encoder(action_input.state, embodiment_id)
+```
+
+**Note**: State encoding is identical in training and inference - unlike Action Encoding, there is no timestep conditioning or noise injection.
+
+#### Comparison with Action Encoder
+
+| Aspect | State Encoder | Action Encoder |
+|--------|---------------|----------------|
+| **Class** | `CategorySpecificMLP` | `MultiEmbodimentActionEncoder` |
+| **Layers** | 2 (`layer1`, `layer2`) | 3 (`W1`, `W2`, `W3`) |
+| **Timestep Conditioning** | ❌ None | ✅ Sinusoidal positional encoding |
+| **Activation** | ReLU | Swish (SiLU) |
+| **Input Sequence Length** | 1 (single state) | 16 (action horizon) |
+| **Training/Inference Difference** | Identical | Different (noise vs. iterative denoising) |
+
+**Cross-Reference**: See [Section 2: Action Encoder](#action-encoder) for detailed architecture comparison.
+
+<a id="action-encoding-training-vs-inference"></a>
+### Action Encoding: Training vs Inference
+
+The Action Encoder (`MultiEmbodimentActionEncoder`) is used differently during training and inference. This section explains the key differences and clarifies the relationship between timesteps, action tokens, and batch dimensions.
+
+**Cross-Reference**: For architecture details of the `MultiEmbodimentActionEncoder` class, see [Section 2: Action Encoder](#action-encoder).
+
+#### What is `t_discretized`?
+
+The `t_discretized` variable is the **flow matching timestep converted to a discrete bucket index**.
+
+**Training** (`forward()`, line 304-311):
+```python
+# Sample continuous t from transformed Beta distribution
+t = self.sample_time(batch_size, ...)  # t ∈ [0, noise_s] ≈ [0, 0.999]
+t = t[:, None, None]                   # Shape: (B, 1, 1) for broadcast
+
+# Convert continuous → discrete
+t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+# Example: if t = 0.7 and num_timestep_buckets = 1000
+#          t_discretized = int(0.7 * 1000) = 700
+```
+
+**Inference** (`get_action()`, line 369-371):
+```python
+for t in range(num_steps):  # num_steps = 4
+    t_cont = t / float(num_steps)              # 0, 0.25, 0.5, 0.75
+    t_discretized = int(t_cont * self.num_timestep_buckets)  # 0, 250, 500, 750
+```
+
+**Range of `t_discretized`**: 0 (pure noise) to 999 (nearly clean)
+
+**Configuration**: `num_timestep_buckets: int = 1000` (default)
+
+#### Timestep Sampling Distribution
+
+```python
+# Initialization (line 208)
+self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)  # Beta(1.5, 1.0)
+
+# Sampling (line 252-254)
+def sample_time(self, batch_size, device, dtype):
+    sample = self.beta_dist.sample([batch_size])  # sample ∈ [0, 1]
+    return (self.config.noise_s - sample) / self.config.noise_s  # (0.999 - sample) / 0.999
+```
+
+The `Beta(1.5, 1.0)` distribution is **right-skewed**, sampling higher values more often. Combined with the transformation, this means training **favors lower `t` values** (more noise) to better learn the denoising direction.
+
+#### All Action Tokens Share the Same Timestep
+
+A key design choice: **all 16 action tokens in a trajectory share the same noise level/timestep**.
+
+```python
+# In MultiEmbodimentActionEncoder.forward() (lines 89-96):
+def forward(self, actions, timesteps, cat_ids):
+    """
+    actions:   shape (B, T, action_dim)  # T = 16 action tokens
+    timesteps: shape (B,)                 # 1 scalar per batch
+    """
+    b, t, _ = actions.shape
+
+    # Expand single timestep across all T action tokens
+    timesteps = timesteps.unsqueeze(1).expand(-1, t)  # (B,) → (B, T)
+```
+
+**Why Share Timesteps Across Action Tokens?**
+
+1. **Coherent Noise Level**: The entire trajectory is interpolated between noise and ground truth using the same `t`:
+   ```python
+   noisy_trajectory = (1 - t) * noise + t * actions  # t broadcasted across T
+   ```
+
+2. **Single Denoising Step**: During inference, each step moves the **entire trajectory** together:
+   ```python
+   actions = actions + dt * pred_velocity  # Update all 16 tokens together
+   ```
+
+3. **Temporal Consistency**: The DiT learns to denoise trajectories as a coherent whole, not individual tokens independently.
+
+**However, position embeddings differentiate tokens**:
+```python
+if self.config.add_pos_embed:
+    pos_ids = torch.arange(action_features.shape[1], ...)  # [0, 1, 2, ..., 15]
+    pos_embs = self.position_embedding(pos_ids)            # Different for each token
+    action_features = action_features + pos_embs           # Adds temporal order
+```
+
+#### Training Mode: Flow Matching with Random Noise
+
+During training, the action encoder processes **noisy ground-truth trajectories**:
+
+```python
+# FlowmatchingActionHead.forward() (lines 301-312)
+
+# 1. Sample noise and timestep
+actions = action_input.action                              # Ground truth (B, 16, 32)
+noise = torch.randn(actions.shape, device=device)          # (B, 16, 32)
+t = self.sample_time(batch_size, device)                   # (B,) ~ Beta(1.5, 1.0)
+t = t[:, None, None]                                       # (B, 1, 1) for broadcast
+
+# 2. Create noisy trajectory via flow matching interpolation
+noisy_trajectory = (1 - t) * noise + t * actions           # Linear interpolation
+velocity = actions - noise                                  # Target velocity
+
+# 3. Discretize timestep and encode
+t_discretized = (t[:, 0, 0] * 1000).long()                 # (B,) in [0, 999]
+action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+```
+
+**Training Loss** (line 337-339):
+```python
+action_mask = action_input.action_mask
+loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+loss = loss.sum() / action_mask.sum()
+```
+
+#### Inference Mode: Iterative Denoising
+
+During inference, the action encoder processes **progressively denoised trajectories**:
+
+```python
+# FlowmatchingActionHead.get_action() (lines 356-398)
+
+# 1. Start with pure noise
+actions = torch.randn(size=(batch_size, action_horizon, action_dim), ...)
+
+# 2. Iterate through denoising steps
+num_steps = 4  # Default
+dt = 1.0 / num_steps  # = 0.25
+
+for t in range(num_steps):
+    t_cont = t / float(num_steps)          # 0, 0.25, 0.5, 0.75
+    t_discretized = int(t_cont * 1000)     # 0, 250, 500, 750
+
+    timesteps_tensor = torch.full((batch_size,), t_discretized, device=device)
+    action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+
+    # ... DiT forward pass to get predicted velocity ...
+
+    # 3. Euler integration step
+    actions = actions + dt * pred_velocity
+```
+
+#### Training vs Inference Comparison
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| **Action Input** | Ground truth + noise | Pure noise → iteratively refined |
+| **Timestep Source** | Random ~ Beta(1.5, 1.0) | Deterministic: 0, 1/K, 2/K, ... |
+| **Timestep Range** | Continuous [0, 0.999] → [0, 999] | Discrete: 0, 250, 500, 750 |
+| **Forward Passes** | 1 per training step | K=4 per inference call |
+| **Target** | velocity = action - noise | None (no loss) |
+| **Update Rule** | Backprop through MSE loss | Euler: `x = x + dt * v` |
+| **Timestep Sharing** | Same `t` for all 16 tokens | Same `t` for all 16 tokens |
+
+#### Batch Size Dimension Explained
+
+The batch dimension `B` represents **independent trajectory samples processed in parallel**:
+
+- **Training**: Mini-batch size (e.g., 32 training examples)
+- **Inference**: Typically 1 for real-time robot control
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ACTION TENSOR: (B, T, D)                             │
+│                        Example: (4, 16, 32)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  B = 4 (Batch)          T = 16 (Horizon)           D = 32 (Action Dim)      │
+│  ──────────────         ─────────────────          ───────────────────      │
+│  Independent            Temporal sequence          Joint positions +        │
+│  trajectories           of future actions          gripper + padding        │
+│  in parallel            to predict                                          │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ Batch 0: Trajectory for observation #0                                │  │
+│  │ ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬ ─ ─ ┬─────┐              │  │
+│  │ │ t=0 │ t=1 │ t=2 │ t=3 │ t=4 │ t=5 │ ... │     │t=15 │              │  │
+│  │ └──┬──┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘              │  │
+│  │    │                                                                  │  │
+│  │    └─► Each cell is a 32-dim vector:                                  │  │
+│  │        [θ1, θ2, θ3, θ4, θ5, θ6, grip, 0, 0, ..., 0]                  │  │
+│  │         └───────real (6-7 DOF)──────┘ └──padding──┘                   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ Batch 1: Trajectory for observation #1 (independent)                  │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│  ... (Batch 2, Batch 3)                                                     │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ DIMENSION ROLES:                                                            │
+│                                                                             │
+│  B (Batch)   : Parallel samples (training: many, inference: typically 1)   │
+│  T (Horizon) : Future timesteps to predict (default: 16)                   │
+│  D (Action)  : DOF of action space (padded to max_action_dim=32)           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Inference Output**: The model returns all `B` trajectories. For real-time control (B=1), the single trajectory is used directly.
+
+<a id="sequence-construction"></a>
+### Future Tokens and Sequence Construction
+
+This subsection explains how the DiT input sequence (`sa_embs`) is constructed from state features, learnable future tokens, and action features.
+
+#### Purpose of Future Tokens
+
+**Future tokens** are learnable embeddings that provide additional context for action prediction. They serve several purposes:
+
+| Purpose | Description |
+|---------|-------------|
+| **Intermediate Representations** | Allow the model to learn representations between state and action |
+| **Temporal Bridge** | Fill the gap between current state (1 token) and action horizon (16 tokens) |
+| **Learnable Context** | Provide trainable parameters that can encode task-relevant priors |
+| **Attention Targets** | Give the DiT additional tokens to attend to during self-attention |
+
+**Common Confusion Clarification**: The configuration parameter `num_target_vision_tokens: int = 32` controls the number of future tokens, **NOT** VL feature compression. VL features retain their original sequence length through the pipeline.
+
+```python
+# Configuration (flow_matching_action_head.py, line 154)
+num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
+```
+
+#### Future Tokens Implementation
+
+**Initialization** (`flow_matching_action_head.py`, lines 196-197):
+
+```python
+# Create learnable embedding with 32 tokens, each 1536-dimensional
+self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
+#                                  ↑ 32 tokens                      ↑ 1536 dimensions
+nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
+```
+
+**Weight Shape**: `[32, 1536]` (32 learnable tokens × 1536 embedding dimension)
+
+**Batch Expansion** (line 321 for training, line 383 for inference):
+
+```python
+# Expand from (32, 1536) to (B, 32, 1536)
+future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+#               ↑ (32, 1536)      ↑ (1, 32, 1536)    ↑ (B, 32, 1536)
+```
+
+| Step | Operation | Shape | Description |
+|------|-----------|-------|-------------|
+| 1 | `self.future_tokens.weight` | `[32, 1536]` | Raw learnable weights |
+| 2 | `.unsqueeze(0)` | `[1, 32, 1536]` | Add batch dimension |
+| 3 | `.expand(B, -1, -1)` | `[B, 32, 1536]` | Replicate across batch |
+
+**Note**: `.expand()` does not copy data—it creates a view with the same underlying tensor, making it memory-efficient.
+
+#### Complete Sequence Construction
+
+The final `sa_embs` tensor is constructed by concatenating three components:
+
+```mermaid
+flowchart LR
+    subgraph COMPONENTS["📦 Input Components"]
+        S["state_features<br/>(B, 1, 1536)"]
+        F["future_tokens<br/>(B, 32, 1536)"]
+        A["action_features<br/>(B, 16, 1536)"]
+    end
+
+    subgraph CAT["🔗 Concatenation"]
+        OP["torch.cat(dim=1)"]
+    end
+
+    subgraph OUTPUT["📤 Output"]
+        SA["sa_embs<br/>(B, 49, 1536)"]
+    end
+
+    subgraph DIT["🔄 Destination"]
+        DIT_IN["DiT.forward()<br/>hidden_states"]
+    end
+
+    S --> OP
+    F --> OP
+    A --> OP
+    OP --> SA --> DIT_IN
+
+    style S fill:#87CEEB
+    style F fill:#FFD700
+    style A fill:#98FB98
+    style SA fill:#DDA0DD
+```
+
+**Code Implementation** (`flow_matching_action_head.py`, line 322):
+
+```python
+# Concatenate along sequence dimension (dim=1)
+sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+#                    ↑ (B, 1, 1536)  ↑ (B, 32, 1536) ↑ (B, 16, 1536)
+# Result: sa_embs shape = (B, 49, 1536) where 49 = 1 + 32 + 16
+```
+
+| Component | Shape | Source | Description |
+|-----------|-------|--------|-------------|
+| `state_features` | `(B, 1, 1536)` | [State Encoder](#state-encoding) | Current robot state embedding |
+| `future_tokens` | `(B, 32, 1536)` | `nn.Embedding` | Learnable context tokens |
+| `action_features` | `(B, 16, 1536)` | [Action Encoder](#action-encoding-training-vs-inference) | Noisy/denoised action embeddings |
+| **`sa_embs`** | `(B, 49, 1536)` | `torch.cat()` | Complete DiT input sequence |
+
+#### Sequence Position Mapping
+
+Each position in the 49-token `sa_embs` sequence has a specific meaning:
+
+| Position(s) | Token Type | Count | Description |
+|-------------|------------|-------|-------------|
+| 0 | State | 1 | Current robot proprioceptive state |
+| 1-32 | Future | 32 | Learnable intermediate representations |
+| 33-48 | Action | 16 | Future action predictions (action horizon) |
+| **Total** | — | **49** | Complete DiT input sequence |
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    sa_embs: (B, 49, 1536)                                   │
+├─────┬─────────────────────────────────────────┬─────────────────────────────┤
+│ [0] │                [1 ... 32]               │          [33 ... 48]        │
+├─────┼─────────────────────────────────────────┼─────────────────────────────┤
+│State│            Future Tokens                │        Action Tokens        │
+│  1  │               32 tokens                 │          16 tokens          │
+├─────┼─────────────────────────────────────────┼─────────────────────────────┤
+│Curr.│         Learnable Context               │      t=0  t=1  ...  t=15    │
+│robot│         (trained params)                │      (future actions)       │
+│state│                                         │                             │
+└─────┴─────────────────────────────────────────┴─────────────────────────────┘
+```
+
+#### Concrete Example (Bread Dataset with SO-101)
+
+```
+Input Components:
+  - state_features: (1, 1, 1536)   [from State Encoder, cat_ids=31]
+  - future_tokens:  (1, 32, 1536)  [learnable, expanded from (32, 1536)]
+  - action_features: (1, 16, 1536) [from Action Encoder, with t_discretized]
+
+Concatenation:
+  torch.cat((
+      state_features,   # (1, 1, 1536)
+      future_tokens,    # (1, 32, 1536)
+      action_features   # (1, 16, 1536)
+  ), dim=1)
+
+Output:
+  - sa_embs: (1, 49, 1536)
+  - Position 0: state embedding
+  - Positions 1-32: future token embeddings
+  - Positions 33-48: action embeddings for t=0,1,...,15
+
+Passed to DiT:
+  model_output = self.model(
+      hidden_states=sa_embs,           # (1, 49, 1536)
+      encoder_hidden_states=vl_embs,   # (1, seq, 1536)
+      timestep=t_discretized           # (1,)
+  )
+```
+
+#### Training vs Inference Behavior
+
+| Component | Training | Inference | Notes |
+|-----------|----------|-----------|-------|
+| `state_features` | Same | Same | No difference |
+| `future_tokens` | Same | Same | Learned parameters, always identical |
+| `action_features` | Noisy GT trajectory | Iteratively denoised | Key difference |
+| `sa_embs` | Contains noisy actions | Contains progressively cleaner actions | Affects DiT input |
+
+**Key Insight**: `future_tokens` are the **same** in training and inference—they're learned parameters that don't change between modes. Only `action_features` differ based on whether we're training (single noisy forward pass) or inferring (K=4 denoising steps).
+
+#### Code References
+
+| Location | Line | Purpose |
+|----------|------|---------|
+| `FlowmatchingActionHeadConfig` | 154 | `num_target_vision_tokens: int = 32` |
+| `FlowmatchingActionHead.__init__()` | 196-197 | `self.future_tokens = nn.Embedding(...)` |
+| `forward()` (training) | 321-322 | Expand and concatenate |
+| `get_action()` (inference) | 383-384 | Expand and concatenate (inside loop) |
+
+**Cross-References**:
+- State features from [State Encoding](#state-encoding)
+- Action features from [Action Encoding](#action-encoding-training-vs-inference)
+- Architectures from [Section 2: State Encoder](#state-encoder) and [Section 2: Action Encoder](#action-encoder)
+- `sa_embs` passed to [Section 6: DiT](#6-diffusion-transformer-dit)
+
+<a id="training-data-flow"></a>
+### Training Data Flow and Flow Matching
+
+This subsection explains how recorded demonstration data is transformed into training samples and how the flow matching loss is computed. Understanding this data flow is essential for debugging training issues and interpreting loss curves.
+
+#### Overview
+
+**Single Training Sample Construction**: For each sampled frame at time `t`, the dataset extracts: (1) **state** = joint values at time `t`, (2) **action** = joint values at times `t, t+1, ..., t+15` (16-step action horizon), and (3) **VL features** = camera images + language prompt at time `t`. The state and action are the same type of data (joint positions) but serve different temporal roles—the state is the current proprioceptive reading, while the action is a chunk of future joint positions the robot should execute.
+
+**Ground Truth Target During Training**: The training target is **NOT the clean action trajectory directly**. Instead, GR00T uses flow matching where the target is the **velocity** = `actions - noise`. The model learns to predict the direction and magnitude needed to transform noise into the clean action trajectory at any interpolation point `t`.
+
+**Flow Matching Loss Computation**: During training, noise is sampled from N(0,1), a timestep `t` is sampled from a Beta(1.5, 1.0) distribution, and the noisy trajectory is computed as `noisy = (1-t)*noise + t*actions`. The model predicts the velocity from this noisy input, and the loss is `MSE(predicted_velocity, velocity)` where `velocity = actions - noise`.
+
+**Batch Sampling**: Frames are sampled randomly from across all episodes using `EpisodeAwareSampler`. Each batch contains independent (frame, state, action_chunk, VL_features) tuples. The sampler can optionally drop frames near episode boundaries to ensure valid action horizons.
+
+#### State vs Action: Frame Indexing
+
+The key insight is that **state** and **action** both represent joint positions, but at different temporal offsets:
+
+| Concept | Frame Indices | Description | Tensor Shape |
+|---------|---------------|-------------|--------------|
+| **State** | Frame `t` (current) | Current joint configuration | `(B, 1, 64)` after padding |
+| **Action** | Frames `t, t+1, ..., t+15` | Current + future joint trajectory | `(B, 16, 32)` after padding |
+
+**From the whitepaper implementation** (`gr00t/experiment/data_config.py`):
+
+```python
+# Action chunking: H=16 timesteps (current + 15 future)
+action_indices = list(range(16))  # [0, 1, 2, ..., 15] - starts at current frame
+
+# State: current frame only
+state_indices = [0]               # Current state only
+
+# Video observation indices (history for temporal context)
+video_indices = [-1, 0]           # Previous and current frame
+```
+
+**Note**: The action chunk starts at the **current** frame `t=0`, not `t+1`. This means the first action in the chunk is the action to execute *now*, followed by 15 future actions.
+
+**Delta Timestamps Example** (for 30 fps dataset):
+
+```python
+delta_timestamps = {
+    "observation.image": [-0.033, 0.0],          # -1 frame, current frame
+    "observation.state": [0.0],                   # Current state only
+    "action": [0.0, 0.033, 0.066, ..., 0.5],     # 16 steps at 30fps = 0 to ~0.5 sec
+}
+```
+
+#### VL Embeddings Derivation
+
+Vision-Language (VL) embeddings are computed from camera images and language prompt at time `t`:
+
+```python
+# From processor_groot.py (lines 270-294)
+
+# 1. Camera images: collect all observation.images.* keys
+img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
+cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
+video = np.stack(cams, axis=1)  # (B, V, H, W, C) - V cameras (e.g., wrist + scene)
+video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C) - T=1 temporal dim
+
+# 2. Language prompt: task instruction
+lang = comp.get(self.language_key)  # e.g., "Pick up the bread"
+if not lang:
+    lang = "Perform the task."  # Default fallback
+```
+
+| Component | Source | Shape | Description |
+|-----------|--------|-------|-------------|
+| **Video** | `observation.images.*` | `(B, T, V, C, H, W)` | T=1 or 2 frames, V cameras |
+| **Language** | `language` field | String | Task instruction |
+| **VL Embeddings** | Eagle VLM output | `(B, seq, 1536)` | Combined vision-language features |
+
+**Temporal Context for Images**: GR00T can use video history (typically current + 1 previous frame) for visual temporal context, but this is configurable via `video_indices = [-1, 0]`.
+
+#### Flow Matching Training Process
+
+The flow matching training process uses a **single forward pass** per sample (unlike inference which uses K=4 iterative denoising steps).
+
+**Step-by-Step Training Forward Pass** (`flow_matching_action_head.py`, lines 290-343):
+
+```python
+def forward(self, backbone_output, action_input):
+    # Get vision-language embeddings from Eagle VLM
+    vl_embs = backbone_output.backbone_features  # (B, seq, 1536)
+
+    # Get embodiment ID for weight bank selection
+    embodiment_id = action_input.embodiment_id   # (B,) e.g., [31, 31, ...] for SO-101
+
+    # 1. Encode current state (joint positions at time t)
+    state_features = self.state_encoder(action_input.state, embodiment_id)
+    # Shape: (B, 1, 64) → (B, 1, 1536)
+
+    # 2. Get ground truth action trajectory from recorded data
+    actions = action_input.action  # (B, 16, 32) - recorded joint positions t to t+15
+
+    # 3. Sample random noise (same shape as actions)
     noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+    # Shape: (B, 16, 32)
 
-    # Sample timestep τ from Beta distribution
-    t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+    # 4. Sample timestep from Beta(1.5, 1.0) distribution
+    t = self.sample_time(actions.shape[0], device=actions.device)
+    # t ∈ [0, 0.999], right-skewed favoring higher noise levels
+    t = t[:, None, None]  # (B,) → (B, 1, 1) for broadcasting
 
-    # Compute noised action: A_t^τ = τA_t + (1−τ)ε
+    # 5. Create noisy trajectory via linear interpolation
     noisy_trajectory = (1 - t) * noise + t * actions
+    # When t≈0: noisy_trajectory ≈ pure noise
+    # When t≈1: noisy_trajectory ≈ clean action
 
-    # Target velocity: ε − A_t
+    # 6. Compute velocity TARGET (this is what the model learns to predict!)
     velocity = actions - noise
+    # This is the "direction" from noise to clean data
 
-    # Flow matching loss: MSE between predicted and target velocity
+    # 7. Discretize timestep for conditioning
+    t_discretized = (t.squeeze() * self.num_timestep_buckets).long()
+    # Example: t=0.7 → t_discretized=700 (with 1000 buckets)
+
+    # 8. Encode noisy trajectory with timestep conditioning
+    action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+    # Shape: (B, 16, 32) → (B, 16, 1536)
+
+    # 9. Build sequence and run through DiT
+    future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
+    sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+    # Shape: (B, 49, 1536) = 1 state + 32 future + 16 action
+
+    model_output = self.model(
+        hidden_states=sa_embs,
+        encoder_hidden_states=vl_embs,
+        timestep=t_discretized,
+    )
+
+    # 10. Decode to action space
+    pred = self.action_decoder(model_output, embodiment_id)
+    pred_actions = pred[:, -actions.shape[1]:]  # Extract action portion
+
+    # 11. Compute MSE loss against VELOCITY (not clean actions!)
+    action_mask = action_input.action_mask  # (B, 16, 32) mask for valid dimensions
     loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+    loss = loss.sum() / action_mask.sum()
+
+    return {"loss": loss}
 ```
 
-**Adaptive Layer Normalization** (`gr00t/model/action_head/cross_attention_dit.py`):
+**Key Insight**: The model learns to predict **velocity** (`actions - noise`), not the clean actions directly. This velocity represents the direction and magnitude needed to transform noise into clean data at any interpolation point `t`.
+
+#### Batch Construction and Episode Sampling
+
+Batches are constructed by randomly sampling frames from across all episodes using `EpisodeAwareSampler`:
+
+**EpisodeAwareSampler** (`sampler.py`, lines 21-60):
+
 ```python
+class EpisodeAwareSampler:
+    def __init__(
+        self,
+        dataset_from_indices,      # Episode start indices
+        dataset_to_indices,        # Episode end indices
+        drop_n_first_frames=0,     # Drop frames at episode start
+        drop_n_last_frames=0,      # Drop frames at episode end (for action horizon)
+        shuffle=True
+    ):
+        indices = []
+        for start_index, end_index in zip(from_indices, to_indices):
+            # Add all valid frame indices for this episode
+            indices.extend(range(
+                start_index + drop_n_first_frames,
+                end_index - drop_n_last_frames
+            ))
+        self.indices = indices  # All valid frame indices across all episodes
+
+    def __iter__(self):
+        if self.shuffle:
+            for i in torch.randperm(len(self.indices)):
+                yield self.indices[i]
+        else:
+            yield from self.indices
+```
+
+**Delta Indices for Temporal Windowing** (`lerobot_dataset.py`, lines 1024-1037):
+
+```python
+def __getitem__(self, idx):
+    item = self.hf_dataset[idx]
+    ep_idx = item["episode_index"]
+
+    if self.delta_indices is not None:
+        # Get query indices for temporal window
+        query_indices, padding = self._get_query_indices(idx, ep_idx)
+        # Fetches action[idx], action[idx+1], ..., action[idx+15]
+        query_result = self._query_hf_dataset(query_indices)
+        item = {**item, **padding, **query_result}
+
+    return item
+```
+
+| Parameter | Purpose | Typical Value |
+|-----------|---------|---------------|
+| `drop_n_first_frames` | Skip unstable start | 0-5 |
+| `drop_n_last_frames` | Ensure valid action horizon | 15 (for H=16) |
+| `shuffle` | Random sampling order | `True` during training |
+| `batch_size` | Samples per gradient update | 8-64 |
+
+#### Training vs Inference Comparison
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| **Action Input** | GT trajectory + noise (interpolated) | Pure random noise |
+| **Timestep Source** | Random `t ~ Beta(1.5, 1.0)` | Deterministic: 0, 0.25, 0.5, 0.75 |
+| **Target** | `velocity = actions - noise` | N/A (no loss) |
+| **Forward Passes** | 1 per sample | K=4 iterations |
+| **Update Method** | Backprop through MSE loss | Euler: `x = x + dt * v` |
+| **State Input** | From recorded dataset | From live robot sensors |
+| **VL Input** | From recorded cameras + prompt | From live cameras + prompt |
+
+#### Visual Summary: Episode Recording to Training Sample
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    EPISODE RECORDING STRUCTURE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Episode Recording (e.g., 50 episodes, 300 frames each at 30fps):          │
+│   ═══════════════════════════════════════════════════════════════           │
+│   Frame:   ...  t-1    t    t+1   t+2   ...   t+15  t+16  ...              │
+│   Joints:  ...  j₋₁    j₀    j₁    j₂   ...   j₁₅   j₁₆   ...              │
+│   Images:  ...  I₋₁    I₀    I₁    I₂   ...   I₁₅   I₁₆   ...              │
+│                  │      │     └──────────────────┘                          │
+│                  │      │              │                                    │
+│                  ▼      ▼              ▼                                    │
+│            ┌─────────────────────────────────────┐                          │
+│            │  Training Sample at frame t:        │                          │
+│            │  • state = j₀       (current only)  │                          │
+│            │  • action = [j₀, j₁, ..., j₁₅]     │ ← 16-step action chunk   │
+│            │  • images = [I₋₁, I₀]  (history)    │                          │
+│            │  • language = "Pick up the bread"   │                          │
+│            └─────────────────────────────────────┘                          │
+│                              │                                              │
+│                              ▼                                              │
+│   ┌──────────────────────────────────────────────────────────────────────┐  │
+│   │  FLOW MATCHING TRAINING:                                             │  │
+│   │                                                                      │  │
+│   │  noise ~ N(0,1)               shape: (B, 16, 32)                    │  │
+│   │  t ~ Beta(1.5, 1.0)           scalar in [0, 0.999]                  │  │
+│   │  noisy_traj = (1-t)*noise + t*action                                │  │
+│   │  velocity = action - noise    ← THIS IS THE TARGET                  │  │
+│   │                                                                      │  │
+│   │  pred_velocity = DiT(noisy_traj, t, vl_embs, state)                 │  │
+│   │  loss = MSE(pred_velocity, velocity) * action_mask                  │  │
+│   └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Tensor Shapes Throughout Training Pipeline
+
+| Stage | Tensor | Shape | Description |
+|-------|--------|-------|-------------|
+| **Input** | `observation.state` | `(B, D)` | Raw state from dataset (D=6 for SO-101) |
+| **Input** | `action` | `(B, 16, D)` | 16-step action trajectory |
+| **Input** | `video` | `(B, T, V, C, H, W)` | T frames, V cameras |
+| **Padded** | `state` | `(B, 1, 64)` | Zero-padded to max_state_dim |
+| **Padded** | `action` | `(B, 16, 32)` | Zero-padded to max_action_dim |
+| **Noise** | `noise` | `(B, 16, 32)` | Random N(0,1) |
+| **Interpolated** | `noisy_trajectory` | `(B, 16, 32)` | `(1-t)*noise + t*action` |
+| **Target** | `velocity` | `(B, 16, 32)` | `action - noise` |
+| **Encoded State** | `state_features` | `(B, 1, 1536)` | After state encoder |
+| **Encoded Action** | `action_features` | `(B, 16, 1536)` | After action encoder |
+| **Future Tokens** | `future_tokens` | `(B, 32, 1536)` | Learnable embeddings |
+| **Sequence** | `sa_embs` | `(B, 49, 1536)` | Concatenated input to DiT |
+| **VL Features** | `vl_embs` | `(B, seq, 1536)` | Vision-language features |
+| **Prediction** | `pred_velocity` | `(B, 16, 32)` | Model output |
+| **Loss** | `loss` | Scalar | `MSE(pred, target) * mask` |
+
+#### Code References
+
+| Component | File | Lines | Description |
+|-----------|------|-------|-------------|
+| Training forward | `flow_matching_action_head.py` | 290-343 | Main training loop |
+| Noise sampling | `flow_matching_action_head.py` | 303 | `torch.randn()` |
+| Time sampling | `flow_matching_action_head.py` | 252-254 | Beta(1.5, 1.0) distribution |
+| Noisy trajectory | `flow_matching_action_head.py` | 307 | Linear interpolation |
+| Velocity target | `flow_matching_action_head.py` | 308 | `actions - noise` |
+| Loss computation | `flow_matching_action_head.py` | 338-339 | MSE with action mask |
+| Delta timestamps | `lerobot_dataset.py` | 734-737 | Temporal windowing |
+| Episode sampler | `sampler.py` | 21-60 | `EpisodeAwareSampler` |
+| State/action padding | `processor_groot.py` | 296-352 | Zero-padding to max dims |
+
+**Cross-References**:
+- State encoding architecture: [Section 2: State Encoder](#state-encoder)
+- Action encoding architecture: [Section 2: Action Encoder](#action-encoder)
+- State encoding forward pass: [State Encoding](#state-encoding)
+- Action encoding forward pass: [Action Encoding: Training vs Inference](#action-encoding-training-vs-inference)
+- Sequence construction: [Future Tokens and Sequence Construction](#sequence-construction)
+- DiT processing: [Section 6: Diffusion Transformer](#6-diffusion-transformer-dit)
+- Whitepaper correlation: `docs/architecture/groot_whitepaper_implementation_correlation.md`
+
+### Command-Line Interface Mapping
+
+| CLI Argument | Code Location | Effect |
+|--------------|---------------|--------|
+| `--tune-projector` | `FlowmatchingActionHead.tune_projector` | Enables state/action encoder training |
+| `--num-inference-timesteps` | `FlowmatchingActionHeadConfig.num_inference_timesteps` | Number of denoising steps (default: 4) |
+
+---
+
+<a id="6-diffusion-transformer-dit"></a>
+## 6. Diffusion Transformer (DiT)
+
+The Diffusion Transformer processes the state-action sequence with cross-attention to vision-language features, conditioned on the denoising timestep via Adaptive Layer Normalization.
+
+#### Data Flow Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📥 DiT Inputs"]
+        H1["hidden_states = sa_embs<br/>(B, 49, 1536)"]
+        E1["encoder_hidden_states = vl_embs<br/>(B, seq, 1536)"]
+        T1["timestep<br/>(B,) in [0, 999]"]
+    end
+
+    subgraph TEMB["⏱️ Timestep Encoding"]
+        TE1["Timesteps()<br/>sinusoidal (B,) → (B, 256)"]
+        TE2["TimestepEmbedding()<br/>MLP (B, 256) → (B, 512)"]
+        TE3["temb<br/>(B, inner_dim)"]
+    end
+
+    subgraph BLOCKS["🔄 Transformer Blocks (×12)"]
+        B1["Block 0: Cross-Attention<br/>Q=hidden, K/V=vl_embs"]
+        B2["Block 1: Self-Attention<br/>Q=K=V=hidden"]
+        B3["AdaLayerNorm<br/>modulated by temb"]
+        B4["FeedForward (GELU)"]
+        B5["... repeat ×12"]
+    end
+
+    subgraph OUTPUT["📤 Output"]
+        O1["norm_out + AdaLN(temb)"]
+        O2["proj_out_2<br/>Linear(512, output_dim)"]
+        O3["output<br/>(B, 49, output_dim)"]
+    end
+
+    T1 --> TE1 --> TE2 --> TE3
+    H1 --> B1
+    E1 --> B1
+    TE3 --> B3
+    B1 --> B2 --> B3 --> B4 --> B5
+    B5 --> O1
+    TE3 --> O1
+    O1 --> O2 --> O3
+```
+
+#### Function Call Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ActionHead as FlowmatchingActionHead
+    participant DiT as DiT
+    participant Decode as action_decoder
+
+    ActionHead->>DiT: hidden_states=sa_embs, encoder_hidden_states=vl_embs, timestep=t_disc
+    activate DiT
+
+    DiT->>DiT: TimestepEncoder: (B,) → (B,256) → temb (B,inner_dim)
+
+    loop 12 Transformer Blocks
+        alt Even blocks (0,2,4...)
+            DiT->>DiT: CrossAttention(Q=hidden, K/V=vl_embs)
+        else Odd blocks (1,3,5...)
+            DiT->>DiT: SelfAttention(Q=K=V=hidden)
+        end
+        DiT->>DiT: AdaLayerNorm modulated by temb
+        DiT->>DiT: FeedForward (GELU)
+    end
+
+    DiT->>DiT: norm_out + AdaLN(temb)
+    DiT->>DiT: proj_out_2 → output (B,49,output_dim)
+    DiT-->>ActionHead: DiT output (B,49,output_dim)
+    deactivate DiT
+
+    ActionHead->>Decode: model_output, embodiment_id
+```
+
+The DiT implements a transformer with three key innovations:
+
+1. **Timestep Encoding**: Sinusoidal positional encoding converts the continuous timestep to a high-dimensional embedding, which modulates all layer normalizations.
+
+2. **Interleaved Attention**: Even-indexed blocks use cross-attention (Q from hidden states, K/V from VL embeddings), while odd-indexed blocks use self-attention. This alternating pattern enables both VL conditioning and action sequence modeling.
+
+3. **Adaptive Layer Normalization (AdaLayerNorm)**: Instead of standard LayerNorm, AdaLN learns scale and shift parameters from the timestep embedding: `x = norm(x) * (1 + scale) + shift`.
+
+**Cross-Reference**: For architectural overview and comparison with the original DiT paper, see [Section 2: DiT Architecture](#dit-architecture).
+
+### Timestep Conditioning via AdaLayerNorm
+
+The denoising timestep is incorporated through `TimestepEncoder`:
+
+```python
+# cross_attention_dit.py, lines 30-40
+class TimestepEncoder(nn.Module):
+    def __init__(self, embedding_dim, compute_dtype=torch.float32):
+        super().__init__()
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+```
+
+**Timestep Encoding Flow**:
+1. Discrete timestep `t_discretized ∈ [0, 999]` → Sinusoidal encoding `(B,) → (B, 256)`
+2. MLP projection `(B, 256) → (B, inner_dim)` = `(B, 512)`
+3. This `temb` modulates **all** AdaLayerNorm layers throughout the transformer
+
+**Adaptive Layer Normalization (AdaLayerNorm)**:
+
+Every normalization layer is modulated by the timestep embedding:
+
+```python
+# cross_attention_dit.py, lines 43-66
 class AdaLayerNorm(nn.Module):
-    """Adaptive Layer Normalization conditioned on timestep embedding"""
-    def forward(self, x: torch.Tensor, temb: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
         scale, shift = temb.chunk(2, dim=1)
         x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
         return x
 ```
 
-**Inference** (K=4 denoising steps):
-```python
-@torch.no_grad()
-def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature):
-    actions = torch.randn(size=(batch_size, self.config.action_horizon, self.config.action_dim))
-    num_steps = self.num_inference_timesteps  # K=4
-    dt = 1.0 / num_steps
+This is crucial for flow matching—the model needs to know **how noisy the input is** (early timestep = mostly noise, late timestep = almost clean) to predict the appropriate velocity.
 
-    for t in range(num_steps):
-        # ... encode actions and run DiT ...
-        # Euler integration: A_t^{τ+1/K} = A_t^τ + (1/K) * V_θ
-        actions = actions + dt * pred_velocity
+| Input | Output |
+|-------|--------|
+| timestep (B,) | temb (B, inner_dim) |
 
-    return BatchFeature(data={"action_pred": actions})
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - timestep: (1,) [e.g., 700 for t=0.7]
+
+Encoding:
+  - Timesteps(): (1,) → (1, 256) sinusoidal
+  - TimestepEmbedding(): (1, 256) → (1, 512) MLP
+
+Output:
+  - temb: (1, 512)
 ```
 
-<a id="state--action-encoders"></a>
-### State & Action Encoders
+### Dual Timestep Encoding: DiT vs. Action Encoder
 
-> "To process states and actions of varying dimensions across different robot embodiments, we use an MLP per embodiment to project them to a shared embedding dimension as input to the DiT."
-> — *GR00T N1.5 White Paper, Section 2.1*
+GR00T N1.5 uses **two different timestep encoding mechanisms** that serve complementary purposes. Understanding this distinction is crucial for grasping how noise-level information flows through the architecture.
 
-**Embodiment-Specific MLPs** (`gr00t/model/action_head/flow_matching_action_head.py`):
+#### Comparison Table
+
+| Aspect | DiT `TimestepEncoder` | Action Encoder `SinusoidalPositionalEncoding` |
+|--------|----------------------|---------------------------------------------|
+| **File** | `cross_attention_dit.py` lines 30-40 | `action_encoder.py` lines 24-54 |
+| **Class** | `TimestepEncoder` (wraps `diffusers.Timesteps` + `TimestepEmbedding`) | `SinusoidalPositionalEncoding` (custom implementation) |
+| **Input Format** | `(B,)` – one scalar per batch | `(B, T)` – one value per action token (expanded from `(B,)`) |
+| **Input Range** | Discrete: `t_discretized ∈ [0, 999]` | Same discrete timestep, **broadcast to all T tokens** |
+| **Encoding Method** | Sinusoidal → **MLP projection** | **Pure sinusoidal** (no MLP) |
+| **Output Shape** | `(B, inner_dim)` = `(B, 512)` | `(B, T, embedding_dim)` = `(B, 16, 1536)` |
+| **Purpose** | Modulate AdaLayerNorm in DiT transformer blocks | Concatenate with action embeddings for action encoding |
+
+#### Architecture Comparison
+
+**DiT `TimestepEncoder`** uses Hugging Face `diffusers` library components with a learned MLP:
+
 ```python
-class FlowmatchingActionHead(nn.Module):
-    def __init__(self, config):
-        # Embodiment-specific encoders/decoders
-        self.state_encoder = CategorySpecificMLP(
-            num_categories=config.max_num_embodiments,  # Default: 32
-            input_dim=config.max_state_dim,
-            hidden_dim=self.hidden_size,
-            output_dim=self.input_embedding_dim,
+# cross_attention_dit.py, lines 30-40
+class TimestepEncoder(nn.Module):
+    def __init__(self, embedding_dim, compute_dtype=torch.float32):
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+    def forward(self, timesteps):
+        timesteps_proj = self.time_proj(timesteps)             # (B,) → (B, 256) sinusoidal
+        timesteps_emb = self.timestep_embedder(timesteps_proj) # (B, 256) → (B, 512) MLP
+        return timesteps_emb
+```
+
+**Action Encoder `SinusoidalPositionalEncoding`** is a pure sinusoidal encoding with **no learned parameters**:
+
+```python
+# action_encoder.py, lines 24-54
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, embedding_dim):  # 1536
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps):  # (B, T)
+        half_dim = self.embedding_dim // 2  # 768
+        exponent = -torch.arange(half_dim) * (log(10000.0) / half_dim)
+        freqs = timesteps.unsqueeze(-1) * exponent.exp()  # (B, T, 768)
+        return torch.cat([sin(freqs), cos(freqs)], dim=-1)  # (B, T, 1536)
+```
+
+#### Output Dimensionality
+
+| Component | Sinusoidal Dimension | After MLP | Final Output |
+|-----------|---------------------|-----------|--------------|
+| DiT | 256 | 512 (`inner_dim`) | `(B, 512)` – global conditioning vector |
+| Action Encoder | 1536 | N/A | `(B, 16, 1536)` – per-token embedding |
+
+#### How Each Timestep Encoding is Used
+
+**DiT**: The `temb` vector **modulates all AdaLayerNorm layers** throughout the transformer:
+
+```python
+# cross_attention_dit.py, lines 63-66 (AdaLayerNorm.forward)
+x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]  # scale, shift derived from temb
+```
+
+**Action Encoder**: The timestep encoding is **concatenated with action embeddings** and processed through an MLP:
+
+```python
+# flow_matching_action_head.py, lines 99-106 (MultiEmbodimentActionEncoder.forward)
+a_emb = self.W1(actions, cat_ids)           # (B, T, 1536)
+tau_emb = self.pos_encoding(timesteps)       # (B, T, 1536)
+x = torch.cat([a_emb, tau_emb], dim=-1)      # (B, T, 3072)
+x = swish(self.W2(x, cat_ids))               # (B, T, 1536)
+```
+
+#### Information Flow Diagram
+
+```
+                      ┌─────────────────────────────────────┐
+                      │        SHARED TIMESTEP SOURCE       │
+                      │   t_discretized = (t * 1000).long() │
+                      │          shape: (B,)                │
+                      └─────────────┬───────────────────────┘
+                                    │
+              ┌─────────────────────┴─────────────────────┐
+              │                                           │
+              ▼                                           ▼
+┌─────────────────────────────┐        ┌─────────────────────────────────┐
+│    ACTION ENCODER PATH      │        │         DiT PATH                │
+│                             │        │                                 │
+│  timesteps.expand(-1, T)    │        │  timesteps (B,)                 │
+│         (B, T)              │        │         │                       │
+│           │                 │        │         ▼                       │
+│           ▼                 │        │  Timesteps() [diffusers]        │
+│  SinusoidalPositionalEnc    │        │  sinusoidal (B, 256)            │
+│  pure sin/cos (B, T, 1536)  │        │         │                       │
+│           │                 │        │         ▼                       │
+│           ▼                 │        │  TimestepEmbedding() [diffusers]│
+│  cat([a_emb, tau_emb])      │        │  MLP (B, 256) → (B, 512)        │
+│  (B, T, 3072)               │        │         │                       │
+│           │                 │        │         ▼                       │
+│           ▼                 │        │  temb (B, 512)                  │
+│  W2 + swish → W3            │        │         │                       │
+│           │                 │        │         ▼                       │
+│           ▼                 │        │  AdaLayerNorm modulation        │
+│  action_features (B,16,1536)│        │  in all 12 transformer blocks   │
+└─────────────────────────────┘        └─────────────────────────────────┘
+              │                                           │
+              └─────────────────┬─────────────────────────┘
+                                │
+                                ▼
+                       ┌─────────────────┐
+                       │   sa_embs       │
+                       │ (B, 49, 1536)   │
+                       │ [state+future+  │
+                       │  action]        │
+                       └────────┬────────┘
+                                │
+                                ▼
+                       ┌─────────────────┐
+                       │    DiT.forward  │
+                       │  uses BOTH:     │
+                       │  - sa_embs      │
+                       │  - temb         │
+                       └─────────────────┘
+```
+
+#### Why Two Different Encodings?
+
+| Encoding | Information Type | Available To | Purpose |
+|----------|------------------|--------------|---------|
+| Action Encoder's | **Local** per-token | Cross/self-attention (via `sa_embs`) | "How noisy is this specific action token?" |
+| DiT's | **Global** per-batch | Every transformer layer (via AdaLayerNorm) | "What noise level should I expect everywhere?" |
+
+This dual-path design ensures timestep information is available:
+1. **Locally** in each action token's embedding (via action encoder) — enables attention to reason about noise at the token level
+2. **Globally** at every transformer layer (via AdaLayerNorm modulation) — provides consistent noise-level awareness independent of token content
+
+**Cross-Reference**: For details on how the Action Encoder processes timesteps, see [Section 2: Action Encoder](#action-encoder).
+
+### Interleaved Attention Pattern
+
+When `interleave_self_attention=True`, the DiT uses a **dual attention strategy**:
+
+```python
+# cross_attention_dit.py, lines 257-275
+for idx, block in enumerate(self.transformer_blocks):
+    if idx % 2 == 1 and self.config.interleave_self_attention:
+        hidden_states = block(
+            hidden_states,
+            encoder_hidden_states=None,  # Self-attention: no external context
+            temb=temb,
         )
-        self.action_encoder = MultiEmbodimentActionEncoder(...)
-        self.action_decoder = CategorySpecificMLP(...)
+    else:
+        hidden_states = block(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,  # Cross-attention to VL
+            temb=temb,
+        )
 ```
 
-**Embodiment Mapping** (`gr00t/data/embodiment_tags.py`):
+**Attention Pattern by Block**:
 
-| Embodiment Tag | Description | Projector Index |
-|----------------|-------------|-----------------|
-| `new_embodiment` | Fine-tuning new robots (SO-100, etc.) | 31 |
-| `gr1` | Fourier GR-1 humanoid | 24 |
-| `oxe_droid` | Open X-Embodiment Droid | 17 |
+| Block Index | Attention Type | Query | Key/Value | Purpose |
+|-------------|----------------|-------|-----------|---------|
+| 0, 2, 4, ... (Even) | Cross-Attention | `sa_embs` (B, 49, D) | `vl_embs` (B, seq, D) | Ground actions in visual/language context |
+| 1, 3, 5, ... (Odd) | Self-Attention | `sa_embs` | `sa_embs` | Refine internal action sequence consistency |
 
-**ChefMate SO-100 Configuration:**
+**How DiT Handles Different Semantic Token Types**:
+
+The DiT processes all 49 tokens **uniformly** through attention—it doesn't explicitly distinguish state, future, or action tokens. Instead:
+
+1. **Position emerges through learning**: The model learns that position 0 always contains state information, positions 1-32 are free latent slots, and positions 33-48 contain noisy actions
+
+2. **Cross-attention injection**: All 49 tokens attend to VL features equally—state tokens can query "what's the task?", future tokens can capture long-horizon plans, action tokens can query specific manipulation details
+
+3. **Self-attention coherence**: Odd blocks let action tokens attend to each other (temporal consistency) and to state/future tokens (grounding)
+
+| Input | Output |
+|-------|--------|
+| hidden_states (B, 49, D), vl_embs (B, seq, D), temb (B, inner_dim) | hidden (B, 49, D) |
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - hidden_states (sa_embs): (1, 49, 1536)
+  - encoder_hidden_states (vl_embs): (1, 668, 1536)
+  - temb: (1, 512)
+
+Processing:
+  - Block 0 (Cross-Attn): Q=(1,49,512), K/V=(1,668,512) → (1,49,512)
+  - Block 1 (Self-Attn): Q=K=V=(1,49,512) → (1,49,512)
+  - ... alternating pattern continues for 12 blocks
+
+Output:
+  - hidden: (1, 49, 512)
+```
+
+### Output Extraction: From DiT to Action Predictions
+
+**DiT Output Shape**:
+
+The DiT outputs after final AdaLN and projection:
+
 ```python
-embodiment_tag = "new_embodiment"  # Uses projector index 31
-action_dim = 7  # 6 joint positions + 1 gripper
-video_keys = ["video.wrist_cam", "video.front_cam"]  # Dual camera
-state_keys = ["state.joint_positions"]
+# cross_attention_dit.py, lines 290-301
+conditioning = temb
+shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+return self.proj_out_2(hidden_states)  # Linear(inner_dim, output_dim)
 ```
+
+Output shape: `(B, 49, output_dim)` where `output_dim` is typically the action dimension.
+
+**Extracting Action Predictions**:
+
+Action predictions are extracted by **slicing the last 16 tokens**:
+
+```python
+# flow_matching_action_head.py, lines 333-334
+pred = self.action_decoder(model_output, embodiment_id)
+pred_actions = pred[:, -actions.shape[1]:]  # Last 16 positions
+```
+
+**Shape Transformation Pipeline**:
+
+| Step | Shape | Description |
+|------|-------|-------------|
+| DiT output | `(B, 49, output_dim)` | Full sequence output |
+| Action decoder | `(B, 49, 32)` | Decoded via `CategorySpecificMLP` to action dimension |
+| Slice | `(B, 16, 32)` | Extract positions 33-48 (action tokens) |
+
+**Why Slice the Last 16?**
+
+The sequence layout is `[state(1), future(32), action(16)]`:
+- Position 0 outputs the "refined state"—not used for action prediction
+- Positions 1-32 output "future representations"—internal abstractions
+- **Positions 33-48 output the denoised action chunk**—this is what we need
+
+The slicing `pred[:, -actions.shape[1]:]` = `pred[:, -16:]` extracts exactly the action portion.
+
+**Relationship to Action Chunk (Frames t to t+15)**:
+
+| DiT Output Position | Corresponding Frame | Action Index |
+|---------------------|---------------------|--------------|
+| 33 | t | action[0] |
+| 34 | t+1 | action[1] |
+| ... | ... | ... |
+| 48 | t+15 | action[15] |
+
+**Predicted Output Usage**:
+- **Training**: Velocity targets for flow matching loss (`velocity = action - noise`)
+- **Inference**: Velocity estimates for Euler integration (`actions = actions + dt * pred_velocity`)
+
+**Concrete Example (Bread Dataset, B=1)**:
+```
+DiT Forward Pass:
+  Input:
+    hidden_states (sa_embs):          (1, 49, 1536)
+    encoder_hidden_states (vl_embs):  (1, 668, 1536)
+    timestep (t_discretized):         (1,) = [700]
+
+  Processing:
+    temb = TimestepEncoder(700):       (1, 512)
+    Block 0 (Cross-Attn):              Q=(1,49,512), K/V=(1,668,512) → (1,49,512)
+    Block 1 (Self-Attn):               Q=K=V=(1,49,512) → (1,49,512)
+    ... 12 blocks total ...
+
+  Output:
+    model_output:                      (1, 49, output_dim)
+
+Action Extraction:
+  pred = action_decoder(model_output, embodiment_id=31):  (1, 49, 32)
+  pred_actions = pred[:, -16:]:                            (1, 16, 32)
+  └── Predicted velocity for actions at frames t to t+15
+```
+
+### Command-Line Interface Mapping
+
+| CLI Argument | Code Location | Effect |
+|--------------|---------------|--------|
+| `--tune-diffusion-model` | `FlowmatchingActionHead.tune_diffusion_model` | Enables DiT training |
+| `--num-layers` | `DiT.num_layers` | Number of transformer blocks (default: 12) |
+| `--num-attention-heads` | `DiT.num_attention_heads` | Attention heads (default: 8) |
+
+### Training vs. Inference Behavior
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| Timestep | Random t ∈ [0, 1] | Fixed: 0, 0.25, 0.5, 0.75 |
+| Forward Passes | 1 per batch | K=4 per sample |
+| Gradient | Computed | `@torch.no_grad()` |
+| Output Usage | Compute MSE loss | Euler integration step |
+
+**Cross-Reference**: The DiT output is decoded by the Action Decoder (Chapter 7).
 
 ---
 
-<a id="3-fine-tuning-groot-n15"></a>
-## 3. Fine-Tuning GR00T N1.5
+<a id="7-action-decoding"></a>
+## 7. Action Decoding
+
+The action decoding stage converts DiT outputs to predicted velocities (training) or final actions (inference), using embodiment-specific decoders.
+
+#### Data Flow Diagram
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📥 DiT Output"]
+        D1["model_output<br/>(B, 49, output_dim)"]
+        E1["embodiment_id<br/>(B,)"]
+    end
+
+    subgraph DECODE["🎯 Action Decoder"]
+        DC1["action_decoder()<br/>CategorySpecificMLP"]
+        DC2["pred<br/>(B, 49, 32)"]
+        DC3["Slice last 16 positions<br/>pred[:, -16:, :]"]
+        DC4["pred_velocity<br/>(B, 16, 32)"]
+    end
+
+    subgraph TRAIN["📚 Training"]
+        T1["velocity = action - noise"]
+        T2["MSE(pred_velocity, velocity)"]
+        T3["* action_mask"]
+        T4["loss scalar"]
+    end
+
+    subgraph INFER["🚀 Inference"]
+        I1["actions = actions + dt * pred_velocity"]
+        I2["Repeat K=4 times"]
+        I3["Final actions<br/>(B, 16, 32)"]
+    end
+
+    D1 --> DC1
+    E1 --> DC1
+    DC1 --> DC2 --> DC3 --> DC4
+    DC4 --> T1 --> T2 --> T3 --> T4
+    DC4 --> I1 --> I2 --> I3
+```
+
+#### Function Call Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ActionHead as FlowmatchingActionHead
+    participant Decode as action_decoder
+    participant Output as Return
+
+    ActionHead->>Decode: model_output, embodiment_id
+    activate Decode
+    Decode->>Decode: action_decoder(CategorySpecificMLP)
+    Decode->>Decode: pred = decode(output)
+    Decode->>Decode: pred_velocity = pred[:,-16:] (B,16,32)
+    Decode-->>ActionHead: pred_velocity
+    deactivate Decode
+
+    alt Training Mode
+        ActionHead->>ActionHead: loss = MSE(pred_velocity, velocity) * action_mask
+        ActionHead-->>Output: loss scalar
+    else Inference Mode
+        ActionHead->>ActionHead: actions = actions + dt * pred_velocity
+        ActionHead->>ActionHead: Repeat K=4 times
+        ActionHead-->>Output: actions (B,16,D)
+    end
+```
+
+The action decoder implements the final stage of the flow matching pipeline:
+
+1. **Velocity Prediction**: During training, the model predicts the velocity field `v = action - noise`. This is the gradient direction that transforms noise into clean actions.
+
+2. **Euler Integration**: During inference, actions are iteratively refined: `a_{t+dt} = a_t + dt * v_θ(a_t, t)`. With K=4 steps and dt=0.25, the model transforms pure noise into coherent action sequences.
+
+3. **Embodiment-Specific Decoding**: The `CategorySpecificMLP` uses separate weight matrices for each embodiment, enabling the same model to control different robots.
+
+### Action Decoder Projection
+
+**Function**: `action_decoder()` - `CategorySpecificMLP`
+
+Projects DiT output to action dimension using embodiment-specific weights. Slices last 16 positions for the predicted velocity.
+
+| Input | Output |
+|-------|--------|
+| model_output (B, 49, D), embodiment_id (B,) | pred_velocity (B, 16, 32) |
+
+**Code Reference**: `flow_matching_action_head.py:CategorySpecificMLP`
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - model_output: (1, 49, 512)
+  - embodiment_id: (1,) [value: 31]
+
+Processing:
+  - action_decoder output: (1, 49, 32)
+  - Slice last 16: pred[:, -16:, :]
+
+Output:
+  - pred_velocity: (1, 16, 32)
+```
+
+### Loss Computation (Training)
+
+**Function**: MSE with action mask
+
+Computes mean squared error between predicted and target velocities, masked to valid action dimensions.
+
+| Input | Output |
+|-------|--------|
+| pred_velocity (B, 16, 32), velocity (B, 16, 32), action_mask | loss scalar |
+
+**Code Reference**: `flow_matching_action_head.py:FlowmatchingActionHead.forward()`
+
+**Concrete Example (Bread Dataset)**:
+```
+Input:
+  - pred_velocity: (1, 16, 32)
+  - velocity (target): (1, 16, 32) = action - noise
+  - action_mask: (1, 16, 32) [True for first 6 dims]
+
+Output:
+  - loss: MSE(pred_velocity, velocity) * action_mask → scalar
+```
+
+### Euler Integration (Inference)
+
+**Function**: Iterative denoising with K=4 steps
+
+Refines actions from pure noise to clean trajectory using Euler integration: `a_{t+dt} = a_t + dt * v_θ(a_t, t)`.
+
+| Input | Output |
+|-------|--------|
+| actions (B, 16, 32), pred_velocity (B, 16, 32), dt=0.25 | refined actions (B, 16, 32) |
+
+**Code Reference**: `flow_matching_action_head.py:FlowmatchingActionHead.get_action()`
+
+**Concrete Example (Bread Dataset)**:
+```
+Step 0 (t=0.0):
+  - actions: (1, 16, 32) ~ N(0,1) [pure noise]
+  - pred_velocity: (1, 16, 32)
+  - actions = actions + 0.25 * pred_velocity
+
+Step 1 (t=0.25):
+  - actions: (1, 16, 32) [partially denoised]
+  - pred_velocity: (1, 16, 32)
+  - actions = actions + 0.25 * pred_velocity
+
+... repeat for t=0.5, t=0.75
+
+Final Output:
+  - actions: (1, 16, 32) [clean action sequence]
+  - Slice to env_action_dim: (1, 16, 6) [6 joints]
+```
+
+### Command-Line Interface Mapping
+
+| CLI Argument | Code Location | Effect |
+|--------------|---------------|--------|
+| `--num-inference-timesteps` | `FlowmatchingActionHeadConfig.num_inference_timesteps` | K denoising steps (default: 4) |
+| `--action-horizon` | `FlowmatchingActionHeadConfig.action_horizon` | Timesteps per chunk (default: 16) |
+| `--action-dim` | `FlowmatchingActionHeadConfig.action_dim` | Action dimension (6 for SO-101) |
+
+### Training vs. Inference Behavior
+
+| Aspect | Training | Inference |
+|--------|----------|-----------|
+| Method | `forward()` | `get_action()` |
+| Input Actions | Ground truth + noise | Pure noise → refined |
+| Output | Loss scalar | Action tensor (B, 16, D) |
+| Denoising | Single-step velocity prediction | K=4 Euler integration steps |
+| Gradient | Enabled | `@torch.no_grad()` |
+
+**Cross-Reference**: The decoded actions are post-processed by `GrootActionUnpackUnnormalizeStep` (see Chapter 3) to convert from normalized `[-1, 1]` back to robot joint space.
+
+---
+
+<a id="8-fine-tuning-groot-n15"></a>
+## 8. Fine-Tuning GR00T N1.5
 
 This section documents the complete fine-tuning workflow for the SO-100 arm using the ChefMate training pipeline. The workflow follows the [Hugging Face GR00T N1.5 SO-101 Tuning Guide](https://huggingface.co/blog/nvidia/gr00t-n1-5-so101-tuning) but uses ChefMate-specific scripts.
 
@@ -2464,8 +6455,8 @@ Before deploying, ensure:
 
 ---
 
-<a id="4-simulation--data-pipeline"></a>
-## 4. Simulation & Data Pipeline
+<a id="9-simulation--data-pipeline"></a>
+## 9. Simulation & Data Pipeline
 
 This section covers the complete real-to-sim and sim-to-real pipeline, MimicGen data augmentation, and automatic subtask detection.
 
@@ -3550,7 +7541,7 @@ flowchart TB
 
     subgraph Env["🎮 Isaac Sim Environment"]
         TASK[LeIsaac-SO101-AssembleSandwich-Mimic-v0]
-        RESET[reset_to(initial_state)]
+        RESET["reset_to(initial_state)"]
         STEP["env.step(action)"]
         SIGNAL["get_subtask_term_signals()"]
     end
@@ -5461,8 +9452,8 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$isaac_sim_package_path/exts/isaacsim.ro
 
 ---
 
-<a id="5-performance-analysis"></a>
-## 5. Performance Analysis
+<a id="10-performance-analysis"></a>
+## 10. Performance Analysis
 
 <a id="training-performance"></a>
 ### Training Performance
@@ -5489,8 +9480,8 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$isaac_sim_package_path/exts/isaacsim.ro
 
 ---
 
-<a id="6-getting-started"></a>
-## 6. Getting Started
+<a id="11-getting-started"></a>
+## 11. Getting Started
 
 <a id="prerequisites"></a>
 ### Prerequisites
@@ -5540,8 +9531,8 @@ pip install nvidia-gr00t
 
 ---
 
-<a id="7-troubleshooting"></a>
-## 7. Troubleshooting
+<a id="12-troubleshooting"></a>
+## 12. Troubleshooting
 
 This section consolidates debugging solutions from the [Hackaday project logs](https://hackaday.io/project/204187-fine-tuning-gr00t-n15-for-robotic-manipulation).
 
@@ -5833,8 +9824,8 @@ else:
 
 ---
 
-<a id="8-future-work"></a>
-## 8. Future Work
+<a id="13-future-work"></a>
+## 13. Future Work
 
 - [ ] Deformable ingredients (lettuce, tomato)
 - [ ] Bi-manual manipulation (two-arm coordination)

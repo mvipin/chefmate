@@ -15,9 +15,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Consolidated ChefMate directory structure
+CHEFMATE_DIR="$HOME/chefmate"
+LOGS_DIR="${CHEFMATE_DIR}/logs/deployment"
+ISAAC_GROOT_DIR="$HOME/Isaac-GR00T"
+
+# Ensure log directory exists
+mkdir -p "${LOGS_DIR}"
+
 # Configuration (matching your previous successful deployment)
-#TASK_INSTRUCTION="pick up the yellow cheese and put it into the white plate"
-TASK_INSTRUCTION="Do not pick up the yellow cheese. Stay at base"
+TASK_INSTRUCTION="pick up the first bread and put it into the round plate"
+#TASK_INSTRUCTION="pick up the remaining white bread and put it into the round plate"
 POLICY_HOST="localhost"
 POLICY_PORT=8000
 
@@ -93,15 +101,13 @@ echo ""
 read -p "Press Enter when ready to deploy (Ctrl+C to cancel)..."
 echo ""
 
-# Create log file
-LOG_DIR="$HOME/so100-groot-checkpoints/deployment_logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/deployment_$(date +%Y%m%d_%H%M%S).log"
+# Create log file (now in ~/chefmate/logs/deployment/)
+LOG_FILE="${LOGS_DIR}/deployment_$(date +%Y%m%d_%H%M%S).log"
 echo "Deployment log: ${LOG_FILE}"
 echo ""
 
 # Change to Isaac-GR00T examples directory
-cd "$HOME/Isaac-GR00T/examples/SO-100"
+cd "$ISAAC_GROOT_DIR/examples/SO-100"
 
 # Display deployment info
 echo -e "${GREEN}Starting robot deployment...${NC}"
@@ -117,11 +123,13 @@ echo ""
 
 # Run deployment (using your proven configuration with camera indices 0 and 2)
 # NOTE: use_degrees=false (default) because the GR00T model outputs actions in RANGE_M100_100 format (-100 to +100)
+# Add gr00t/eval to PYTHONPATH for service module
+export PYTHONPATH="${ISAAC_GROOT_DIR}/gr00t/eval:${PYTHONPATH}"
 python eval_lerobot.py \
     --robot.type=so101_follower \
     --robot.port=/dev/follower \
     --robot.id=so101_follower \
-    --robot.cameras="{ wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, scene: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" \
+    --robot.cameras="{ wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" \
     --policy_host="${POLICY_HOST}" \
     --policy_port="${POLICY_PORT}" \
     --lang_instruction="${TASK_INSTRUCTION}" \

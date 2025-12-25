@@ -76,7 +76,7 @@ def test_inference_with_mock_data():
     print("Creating mock observation data...")
     
     # Mock images (480x640x3 RGB)
-    mock_scene_image = np.zeros((480, 640, 3), dtype=np.uint8)
+    mock_front_image = np.zeros((480, 640, 3), dtype=np.uint8)
     mock_wrist_image = np.zeros((480, 640, 3), dtype=np.uint8)
     
     # Mock robot state (current joint positions in radians)
@@ -89,7 +89,7 @@ def test_inference_with_mock_data():
     
     # Prepare request
     observation = {
-        'video.scene': mock_scene_image,
+        'video.front': mock_front_image,
         'video.wrist': mock_wrist_image,
         'state.single_arm': mock_single_arm,
         'state.gripper': mock_gripper,

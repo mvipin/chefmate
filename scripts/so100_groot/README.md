@@ -4,11 +4,35 @@
 
 This directory contains automated scripts for the complete SO-100 GR00T N1.5 workflow, customized for your specific setup and proven configuration.
 
-**Task**: Pick striped block and place it in the white plate
-**Dataset Size**: 20 episodes
+**Task**: Multi-ingredient sandwich assembly
 **Recording Mode**: Teleoperation (using leader arm)
-**Training Steps**: 1000 steps
-**Estimated Total Time**: ~1.5-2 hours
+**Training**: LoRA fine-tuning with GR00T N1.5
+**Estimated Total Time**: ~2-3 hours for full pipeline
+
+---
+
+## 📁 Consolidated Directory Structure
+
+All data is organized with datasets on high-speed NVMe storage:
+
+```
+~/chefmate/
+├── datasets -> /mnt/nvme_data/chefmate_datasets/  # Symlink to NVMe
+├── checkpoints/               # Trained model checkpoints
+├── logs/
+│   ├── training/              # Training logs
+│   └── deployment/            # Deployment logs
+└── scripts/so100_groot/       # This workflow scripts directory
+
+/mnt/nvme_data/chefmate_datasets/   # NVMe storage (795GB, fast I/O)
+├── lerobot/rubbotix/              # Raw LeRobot datasets (recording)
+└── groot_format/                  # GR00T-formatted datasets (training)
+```
+
+**Benefits of NVMe Storage:**
+- **Fast I/O**: NVMe SSD for fast dataset read/write during training
+- **Large Capacity**: 795GB available for multiple datasets
+- **Script Compatibility**: Symlink ensures all paths work unchanged
 
 ---
 
@@ -24,7 +48,7 @@ nvidia-smi
 
 ### Run Complete Workflow
 ```bash
-cd ~/lerobot/scripts/so100_groot
+cd ~/chefmate/scripts/so100_groot
 
 # Phase 1: Record dataset (20-30 minutes)
 ./01_record_dataset.sh
@@ -40,106 +64,21 @@ cd ~/lerobot/scripts/so100_groot
 
 # Phase 4b: Deploy on robot (Terminal 2)
 ./05_deploy_robot.sh
+
+# ===== Additional Tools =====
+
+# Visualize recorded episodes with Rerun.io
+./visualize_episodes.sh [dataset_name] [episode_number]
+
+# Open-loop evaluation (compare predictions vs ground truth)
+./06_open_loop_eval.sh [checkpoint_name] [dataset_name]
+
+# Replay episode on robot (pure action playback)
+./07_replay_episode.sh [dataset_name] [episode_number]
+
+# Migrate data from old locations
+./migrate_existing_data.sh [--dry-run]
 ```
-
----
-
-## ⚠️ CRITICAL TRAINING CONFIGURATION ISSUE
-
-### Language Conditioning Not Working - Root Cause Identified
-
-**Problem**: Models trained with the previous configuration **DO NOT respond to language instructions**. The model ignores task descriptions and relies purely on visual state-based heuristics.
-
-#### Evidence from Testing:
-
-**Test Case**: Multitask model trained on both cheese and bread datasets
-- **Expected**: Model should differentiate between "pick up cheese" vs "pick up bread" instructions
-- **Actual**: Model exhibits identical behavior regardless of language instruction
-- **Extreme Test**: "do not pick up cheese" still causes robot to pick up cheese
-
-#### Model Behavior Analysis:
-
-The model learned a **position-based state machine** instead of language-conditioned behavior:
-
-**Single Ingredient Scenarios:**
-1. Nothing in plate or holder → Random search (no clear target)
-2. One ingredient in holder only → Grasp and place in plate
-3. One ingredient in plate only → Stop (task complete)
-
-**Two Ingredient Scenarios:**
-4. Both ingredients in holder → Randomly select one to grasp
-5. One in plate, one in holder → Stop (task complete)
-6. Both in plate → Stop (task complete)
-
-**Conclusion**: The model uses visual heuristic "if object in plate → task done" rather than understanding language instructions.
-
-#### Root Cause:
-
-The training script previously used `--no-tune_diffusion_model` flag, which **froze the action prediction head** (diffusion model). This prevented the model from learning proper language conditioning.
-
-**Previous (BROKEN) Configuration:**
-```bash
---no-tune_diffusion_model    # ❌ Action head frozen - cannot learn language conditioning
-tune_llm: False              # ❌ Language encoder frozen
-tune_visual: False           # ❌ Vision encoder frozen
-tune_projector: True         # ✅ Only tiny projector layer trainable
-```
-
-**Result**: Only ~0.24% of model parameters were trainable, and the critical action prediction component was completely frozen.
-
-#### Fix Applied (2025-10-19):
-
-**Removed `--no-tune_diffusion_model` flag** to enable proper training:
-
-```bash
-# Now training with:
-tune_diffusion_model: True   # ✅ Action head trainable (LoRA rank 32)
-tune_projector: True         # ✅ Projector trainable (LoRA rank 32)
-tune_llm: False              # ❌ LLM frozen (NOT OK - see update below!)
-tune_visual: False           # ❌ Vision frozen (NOT OK - see update below!)
-```
-
-**Trainable parameters**: 6,553,600 (0.24% of total) - but now includes the critical diffusion model
-
-#### ⚠️ CRITICAL UPDATE (2025-10-19 - Later):
-
-**User reported**: Language conditioning still fails even with diffusion model training enabled!
-
-**Root Cause**: The **Eagle VLM backbone** (vision-language model) is completely frozen. Eagle processes both images and text together to create joint embeddings. When frozen, Eagle cannot learn to differentiate between similar instructions like "pick cheese" vs "pick bread".
-
-**The fundamental issue**:
-- Eagle was pre-trained on general VLM tasks (image captioning, VQA)
-- Eagle has never seen your specific tasks
-- Frozen Eagle produces nearly identical embeddings for similar instructions
-- Diffusion model has no signal to differentiate tasks
-- Result: Model learns visual heuristics instead of language conditioning
-
-**REQUIRED FIX for Multitask Learning**:
-```bash
-# Enable LLM fine-tuning (minimum requirement)
-tune_llm: True               # ✅ REQUIRED for language conditioning
-tune_visual: False           # Can stay frozen to save VRAM
-tune_diffusion_model: True   # ✅ Required
-tune_projector: True         # ✅ Required
-
-# OR enable both (best results, but needs more VRAM)
-tune_llm: True               # ✅ REQUIRED
-tune_visual: True            # ✅ RECOMMENDED
-tune_diffusion_model: True   # ✅ Required
-tune_projector: True         # ✅ Required
-```
-
-**VRAM Requirements**:
-- LLM only: ~12-16GB (may fit on RTX 4080 Super with reduced batch size)
-- LLM + Vision: ~20-24GB (likely too much for RTX 4080 Super)
-- Workaround: Reduce LoRA rank from 32 to 16 to save VRAM
-
-#### Important Notes:
-
-1. **All models trained before 2025-10-19 are affected** - they cannot properly use language conditioning
-2. **Retrain required**: Models must be retrained with the corrected configuration
-3. **VRAM requirement**: Ensure inference server is stopped before training (needs ~8GB VRAM)
-4. **Training time**: Expect ~5-7 seconds per step (vs ~3-4 seconds with frozen diffusion model)
 
 ---
 
@@ -152,7 +91,7 @@ tune_projector: True         # ✅ Required
 - Activates lerobot environment
 - Checks device permissions and mappings (follower + leader arms)
 - Verifies calibration files for both arms
-- Records dataset with scene + wrist cameras at 640x480 (smooth recording)
+- Records dataset with front + wrist cameras at 640x480 (smooth recording)
 - Uses leader arm to control follower arm (teleoperation)
 - Saves to `~/.cache/huggingface/lerobot/rubbotix/striped-block/`
 
@@ -176,7 +115,7 @@ tune_projector: True         # ✅ Required
 **What it does**:
 - Activates gr00t environment
 - Copies dataset to `~/Isaac-GR00T/demo_data/stripped-block/`
-- Creates custom `modality.json` with scene/wrist camera keys
+- Creates custom `modality.json` with front/wrist camera keys
 - Validates dataset loading
 
 **Duration**: 5 minutes
@@ -262,7 +201,7 @@ Episode Time: 30s
 Reset Time: 30s
 Cameras:
   - wrist: /dev/wrist (640x480 @ 30fps)
-  - scene: /dev/scene (640x480 @ 30fps)
+  - front: /dev/scene (640x480 @ 30fps)
 Arms:
   - Follower: /dev/follower (performs task)
   - Leader: /dev/leader (controlled by human)
@@ -295,11 +234,11 @@ Cameras:
 
 ---
 
-## File Locations
+## File Locations (Consolidated in ~/chefmate/)
 
-### Dataset Files
+### LeRobot Dataset Files
 ```
-~/.cache/huggingface/lerobot/rubbotix/striped-block/
+~/chefmate/datasets/lerobot/rubbotix/{dataset_name}/
 ├── data/chunk-000/
 │   ├── episode_000000.parquet
 │   └── ...
@@ -312,30 +251,31 @@ Cameras:
     └── ...
 ```
 
-### GR00T Dataset
+### GR00T Format Dataset
 ```
-~/Isaac-GR00T/demo_data/striped-block/
+~/chefmate/datasets/groot_format/{dataset_name}/
 ├── data/
 ├── meta/
-│   └── modality.json  ← Custom scene/wrist config
+│   ├── modality.json  ← Custom front/wrist config
+│   └── episodes.jsonl
 └── videos/
 ```
 
 ### Checkpoints
 ```
-~/so100-groot-checkpoints/striped-block/
-├── checkpoint-200/
-├── checkpoint-400/
-├── checkpoint-600/
-├── checkpoint-800/
+~/chefmate/checkpoints/{dataset_name}/
+├── checkpoint-500/
 ├── checkpoint-1000/
+├── ...
 └── tensorboard/
 ```
 
-### Deployment Logs
+### Logs
 ```
-~/so100-groot-checkpoints/deployment_logs/
-└── deployment_YYYYMMDD_HHMMSS.log
+~/chefmate/logs/
+├── training/
+└── deployment/
+    └── deployment_YYYYMMDD_HHMMSS.log
 ```
 
 ---
@@ -436,11 +376,11 @@ tail -f ~/so100-groot-checkpoints/deployment_logs/deployment_*.log
 
 ## Expected Performance
 
-### Training Metrics (Updated 2025-10-19)
+### Training Metrics
 - **Loss**: 1.0 → 0.15-0.20 over 1000 steps
-- **VRAM Usage**: ~8GB (with corrected configuration)
-- **Training Speed**: ~5-7 seconds per step (with diffusion model training enabled)
-- **Total Time**: ~1.5-2 hours for 1000 steps
+- **VRAM Usage**: 12-14GB
+- **Training Speed**: ~1.5-2 seconds per step
+- **Total Time**: 20-30 minutes
 
 ### Inference Metrics
 - **Latency**: 50-80ms per action
@@ -510,71 +450,13 @@ width: 1920, height: 1080
 
 ---
 
-## Troubleshooting
-
-### CUDA Out of Memory During Training
-
-**Symptom**: Training fails with `torch.OutOfMemoryError: CUDA out of memory`
-
-**Cause**: Inference server or other GPU processes are still running
-
-**Solution**:
-```bash
-# 1. Check GPU usage
-nvidia-smi
-
-# 2. Find Python processes using GPU
-ps aux | grep python | grep -E "inference_service|eval_lerobot"
-
-# 3. Kill the process (replace PID with actual process ID)
-kill <PID>
-
-# 4. Verify GPU is free
-nvidia-smi  # Should show <500MB usage
-
-# 5. Restart training
-cd ~/lerobot/scripts/so100_groot
-./03_train_model.sh
-```
-
-**Prevention**: Always stop the inference server before training:
-```bash
-pkill -f inference_service.py
-```
-
-### Training Speed Very Slow
-
-**Expected**: ~5-7 seconds per step (with diffusion model training enabled)
-
-**If slower than 10 seconds per step**:
-1. Check GPU utilization: `nvidia-smi` (should be 90-100%)
-2. Reduce batch size in `03_train_model.sh`: `BATCH_SIZE=8`
-3. Reduce dataloader workers: `DATALOADER_NUM_WORKERS=4`
-
-### Model Ignores Language Instructions
-
-**Symptom**: Robot performs same action regardless of task instruction
-
-**Cause**: Model trained with `--no-tune_diffusion_model` flag (before 2025-10-19 fix)
-
-**Solution**: Retrain model with corrected configuration (see Critical Issue section above)
-
-### Loss Not Decreasing
-
-**Expected loss progression**:
-- Step 100: ~0.8-1.0
-- Step 500: ~0.3-0.5
-- Step 1000: ~0.15-0.25
-
-**If loss stays high (>0.8) after 500 steps**:
-1. Check dataset quality: Review recorded episodes
-2. Increase learning rate: `LEARNING_RATE=0.0002`
-3. Train longer: `MAX_STEPS=3000`
-4. Record more diverse episodes
-
----
-
 ## Advanced Options
+
+### Enable Diffusion Model Tuning
+Edit `03_train_model.sh`, remove this line:
+```bash
+--no-tune_diffusion_model \
+```
 
 ### Adjust LoRA Parameters
 Edit `03_train_model.sh`:
@@ -592,25 +474,119 @@ Edit `03_train_model.sh`:
 
 ---
 
+## 🔍 Rerun.io Integration
+
+[Rerun](https://rerun.io) is a visualization tool for multimodal data, integrated into LeRobot for dataset inspection and debugging.
+
+### What is Rerun.io?
+
+Rerun is an open-source toolkit for logging, visualizing, and debugging temporal multimodal data. In robotics, it's used to:
+
+- **Visualize camera feeds** side-by-side with synchronized timestamps
+- **Plot joint trajectories** and action values over time
+- **Debug robot behavior** by scrubbing through episodes frame-by-frame
+- **Analyze data quality** before training
+
+### How LeRobot Uses Rerun
+
+LeRobot's `lerobot-dataset-viz` command uses Rerun to render:
+1. **Camera images** from `observation.images.front` and `observation.images.wrist`
+2. **State trajectories** from `observation.state` (6 joint values)
+3. **Action values** from `action` (6 joint commands)
+4. **Episode metadata** (timestamps, frame indices)
+
+### Using Rerun for ChefMate
+
+```bash
+# Activate lerobot environment
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate lerobot
+
+# Basic usage - visualize episode 0 of test1
+./visualize_episodes.sh test1 0
+
+# Visualize specific dataset and episode
+./visualize_episodes.sh cheese 10
+
+# Direct command with custom options
+lerobot-dataset-viz \
+    --repo-id rubbotix/test1 \
+    --root ~/chefmate/datasets/lerobot \
+    --episode-index 0 \
+    --mode local
+```
+
+### Rerun Viewer Controls
+
+Once the viewer opens:
+- **Timeline scrubbing**: Drag the timeline to navigate through frames
+- **Pan/Zoom**: Mouse drag and scroll in camera views
+- **Space bar**: Play/pause automatic playback
+- **Entity panels**: Show/hide specific data streams
+- **Log filtering**: Filter by entity path or type
+
+### Remote Visualization (SSH)
+
+For viewing datasets on a remote machine:
+
+```bash
+# On remote machine (server)
+lerobot-dataset-viz \
+    --repo-id rubbotix/test1 \
+    --root ~/chefmate/datasets/lerobot \
+    --episode-index 0 \
+    --mode distant \
+    --ws-port 9087
+
+# On local machine (with SSH tunnel)
+ssh -L 9087:localhost:9087 username@remote-host
+rerun ws://localhost:9087
+```
+
+### Saving Visualizations
+
+```bash
+# Save .rrd file for later viewing
+lerobot-dataset-viz \
+    --repo-id rubbotix/test1 \
+    --root ~/chefmate/datasets/lerobot \
+    --episode-index 0 \
+    --save 1 \
+    --output-dir ~/chefmate/assets/visualizations
+
+# View saved recording
+rerun ~/chefmate/assets/visualizations/rubbotix_test1_episode_0.rrd
+```
+
+### Interpreting Rerun Visualizations
+
+| Panel | What to Look For |
+|-------|------------------|
+| **Camera feeds** | Clear view of workspace, no occlusion, consistent lighting |
+| **State trajectory** | Smooth joint movements, no sudden jumps or spikes |
+| **Action values** | Actions match states with slight offset (command vs actual) |
+| **Timeline** | Consistent frame rate (30 fps), no dropped frames |
+
+### Debugging with Rerun
+
+Common issues visible in Rerun:
+1. **Camera dropout**: Black frames indicate camera disconnect
+2. **Jittery motion**: Spiky state values suggest vibration or noise
+3. **Action mismatch**: Large gaps between action and state suggest lag
+4. **Synchronization**: Misaligned camera timestamps
+
+---
+
 ## Support Resources
 
-- **Main Documentation**: `~/lerobot/SO100_GROOT_IMPLEMENTATION_PROPOSAL.md`
-- **Compatibility Info**: `~/lerobot/COMPATIBILITY_ASSESSMENT.md`
-- **Quick Reference**: `~/lerobot/QUICK_REFERENCE.md`
+- **ChefMate Documentation**: `~/chefmate/README.md`
 - **Seeed Studio Docs**: https://wiki.seeedstudio.com/lerobot_so100m_new
 - **NVIDIA GR00T**: https://github.com/NVIDIA/Isaac-GR00T
 - **LeRobot**: https://github.com/huggingface/lerobot
+- **Rerun.io**: https://rerun.io/docs
 
 ---
 
 ## Version History
-
-- **v1.1** (2025-10-19): Critical bug fix
-  - **FIXED**: Removed `--no-tune_diffusion_model` flag that prevented language conditioning
-  - Models can now properly learn from language instructions
-  - Updated training metrics (slower but correct)
-  - Added troubleshooting section for VRAM issues
-  - Documented model behavior analysis
 
 - **v1.0** (2025-10-04): Initial release
   - Customized for RTX 4080 Super (16GB)
@@ -618,7 +594,6 @@ Edit `03_train_model.sh`:
   - Optimized for 1000 steps training
   - Scene/wrist camera naming
   - 20 episode dataset
-  - ⚠️ **DEPRECATED**: Had `--no-tune_diffusion_model` bug
 
 ---
 

@@ -34,7 +34,7 @@ def view_camera(device_path, width=640, height=480):
         print(f"Error: Could not open camera at {device_path}")
         print("\nAvailable devices:")
         import os
-        devices = [f for f in os.listdir('/dev') if f.startswith('video') or f in ['scene', 'wrist']]
+        devices = [f for f in os.listdir('/dev') if f.startswith('video') or f in ['front', 'wrist']]
         for dev in sorted(devices):
             print(f"  /dev/{dev}")
         sys.exit(1)

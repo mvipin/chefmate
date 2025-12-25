@@ -1,0 +1,105 @@
+=============================================================================
+                    CHEFMATE EVALUATION DATA COLLECTION GUIDE
+=============================================================================
+
+COLUMN DEFINITIONS
+------------------
+RQ_ID           : Research Question identifier (RQ1-RQ10)
+Test_ID         : Specific test case identifier within the RQ
+Trial           : Trial number (1-3)
+Instruction     : Language command given to the model
+Target_Object   : Object that should be manipulated (bread_1, bread_2, cheese)
+Scene_Setup     : Description of objects present in the scene
+Distractors     : Non-target objects in the scene
+Object_Pose     : Orientation of target object (standard, rotated_90)
+Source_Zone     : Starting position of target (1-9 grid, see below)
+Dest_Zone       : Destination position / plate location
+Result          : Trial outcome code (see below)
+Partial_Success : 1 if arm moved toward correct object, 0 otherwise
+Notes           : Additional observations
+Timestamp       : Date/time of trial
+
+RESULT CODES
+------------
+SUCCESS         : Task completed successfully (correct object in plate)
+WRONG_OBJECT    : Grasped incorrect object
+DROP            : Correct object dropped during transport
+MISS            : Failed to grasp any object
+TIMEOUT         : No completion within 30 seconds
+COLLISION       : Collision with obstacles
+NO_ACTION       : No movement (relevant for RQ3/RQ9 tests)
+PARTIAL         : Arm moved toward correct object but grasp failed
+
+PARTIAL SUCCESS CRITERIA (RQ1)
+------------------------------
+Mark Partial_Success = 1 if:
+- Arm moved in the direction of the target object
+- End effector approached within 5cm of target object
+- Intention to grasp correct object was evident
+
+WORKSPACE ZONE GRID (3x3)
+-------------------------
+         Camera View
+    ┌─────────────────────────┐
+    │  (1)      (2)      (3)  │
+    │  L-Far    C-Far    R-Far│
+    ├─────────────────────────┤
+    │  (4)      (5)      (6)  │
+    │  L-Mid    C-Mid    R-Mid│
+    ├─────────────────────────┤
+    │  (7)      (8)      (9)  │
+    │  L-Near   C-Near   R-Near│
+    └─────────────────────────┘
+          Robot Base
+
+Zone 5 = Center (training position)
+Corners = Zones 1, 3, 7, 9
+Edges = Zones 2, 4, 6, 8
+
+RESEARCH QUESTIONS SUMMARY
+--------------------------
+RQ1  : Object Discrimination (D1.1-D1.6)
+       Can model differentiate between bread_1, bread_2, cheese?
+
+RQ2  : Manipulation Skills (G1.1-G3.2)
+       Grasp quality across object types and orientations
+
+RQ3  : Task Completion Recognition (TC1.1-TC1.3)
+       Does model recognize when task is already complete?
+
+RQ4  : Source Position Perturbation (SP1.1-SP1.4)
+       Robustness to object position changes
+
+RQ5  : Destination Perturbation (DP1.1-DP1.4)
+       Robustness to plate position changes
+
+RQ6  : Distractor Handling (DH1-DH4)
+       Performance with increasing distractors
+
+RQ7  : Scene Complexity (SC1-SC4)
+       Degradation across complexity levels
+
+RQ8  : Prompt Variations (PV1.1-PV1.3)
+       Language robustness to paraphrases
+
+RQ9  : Misleading Instructions (MI1-MI4)
+       Response to incorrect descriptors
+
+RQ10 : Novel Object Generalization (G1.1-G3.1)
+       Zero-shot transfer to new plate types
+
+TRIAL PROTOCOL
+--------------
+1. Reset scene to initial configuration
+2. Position objects according to Test_ID specification
+3. Record initial state (verify camera feed)
+4. Issue instruction to model
+5. Execute policy (30-second timeout)
+6. Record Result code
+7. If grasp failed, assess Partial_Success
+8. Add Notes for any anomalies
+9. Record Timestamp
+10. Repeat for all 3 trials per Test_ID
+
+TOTAL TRIALS: 103 (35 test conditions × 3 trials, minus 2 reduced sets)
+

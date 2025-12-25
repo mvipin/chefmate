@@ -14,10 +14,21 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-DATASET_NAME="bread"
-LEROBOT_CACHE="$HOME/.cache/huggingface/lerobot"
-ISAAC_GROOT_DIR="$HOME/Isaac-GR00T"
+DATASET_NAME="seq1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Consolidated ChefMate directory structure
+CHEFMATE_DIR="$HOME/chefmate"
+DATASETS_DIR="${CHEFMATE_DIR}/datasets/lerobot"
+GROOT_DATASETS_DIR="${CHEFMATE_DIR}/datasets/groot_format"
+ISAAC_GROOT_DIR="$HOME/Isaac-GR00T"
+
+# Source and destination paths
+SOURCE_LEROBOT="${DATASETS_DIR}/rubbotix/${DATASET_NAME}"
+DEST_GROOT="${GROOT_DATASETS_DIR}/${DATASET_NAME}"
+
+# Ensure directories exist
+mkdir -p "${GROOT_DATASETS_DIR}"
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}SO-100 Dataset Preparation for GR00T${NC}"
@@ -25,8 +36,8 @@ echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "${BLUE}Configuration:${NC}"
 echo -e "  Dataset Name: ${YELLOW}${DATASET_NAME}${NC}"
-echo -e "  Source: ${YELLOW}${LEROBOT_CACHE}/rubbotix/${DATASET_NAME}${NC}"
-echo -e "  Destination: ${YELLOW}${ISAAC_GROOT_DIR}/demo_data/${DATASET_NAME}${NC}"
+echo -e "  Source: ${YELLOW}${SOURCE_LEROBOT}${NC}"
+echo -e "  Destination: ${YELLOW}${DEST_GROOT}${NC}"
 echo ""
 
 # Check if gr00t environment exists
@@ -41,11 +52,13 @@ echo -e "${GREEN}Activating gr00t environment...${NC}"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gr00t
 
-# Check source dataset
-SOURCE_DATASET="${LEROBOT_CACHE}/rubbotix/${DATASET_NAME}"
-if [ ! -d "$SOURCE_DATASET" ]; then
-    echo -e "${RED}Error: Source dataset not found at ${SOURCE_DATASET}${NC}"
-    echo "Please run 01_record_dataset.sh first"
+# Check source dataset (now in ~/chefmate/datasets/lerobot/)
+if [ ! -d "$SOURCE_LEROBOT" ]; then
+    echo -e "${RED}Error: Source dataset not found at ${SOURCE_LEROBOT}${NC}"
+    echo ""
+    echo "Please run 01_record_dataset.sh first, or if your dataset is in the"
+    echo "old location (~/.cache/huggingface/lerobot/), migrate it with:"
+    echo "  cp -r ~/.cache/huggingface/lerobot/rubbotix/${DATASET_NAME} ${DATASETS_DIR}/rubbotix/"
     exit 1
 fi
 
@@ -55,7 +68,7 @@ echo ""
 # Validate source dataset structure
 echo -e "${GREEN}Validating source dataset structure...${NC}"
 for dir in data meta videos; do
-    if [ ! -d "$SOURCE_DATASET/$dir" ]; then
+    if [ ! -d "$SOURCE_LEROBOT/$dir" ]; then
         echo -e "${RED}Error: Missing directory: $dir${NC}"
         exit 1
     fi
@@ -64,34 +77,39 @@ done
 echo ""
 
 # Create destination directory
-DEST_DATASET="${ISAAC_GROOT_DIR}/demo_data/${DATASET_NAME}"
 echo -e "${GREEN}Creating destination directory...${NC}"
-mkdir -p "$DEST_DATASET"
+mkdir -p "$DEST_GROOT"
 
 # Copy dataset
-echo -e "${GREEN}Copying dataset to Isaac-GR00T directory...${NC}"
-echo "  From: ${SOURCE_DATASET}"
-echo "  To: ${DEST_DATASET}"
+echo -e "${GREEN}Copying dataset to GR00T format directory...${NC}"
+echo "  From: ${SOURCE_LEROBOT}"
+echo "  To: ${DEST_GROOT}"
 echo ""
 
 # Use rsync for efficient copying with progress
 # Note: --no-perms --no-owner --no-group flags prevent harmless permission warnings
 if command -v rsync &> /dev/null; then
-    rsync -ah --info=progress2 --no-perms --no-owner --no-group "$SOURCE_DATASET/" "$DEST_DATASET/"
+    rsync -ah --info=progress2 --no-perms --no-owner --no-group "$SOURCE_LEROBOT/" "$DEST_GROOT/"
 else
     echo -e "${YELLOW}rsync not found, using cp (slower)${NC}"
-    cp -r "$SOURCE_DATASET/"* "$DEST_DATASET/"
+    cp -r "$SOURCE_LEROBOT/"* "$DEST_GROOT/"
 fi
 
 echo ""
 echo -e "${GREEN}Dataset copied successfully${NC}"
 echo ""
 
+# Remove LeRobot stats.json - GR00T will regenerate with correct format (includes q01/q99)
+if [ -f "$DEST_GROOT/meta/stats.json" ]; then
+    echo -e "${YELLOW}Removing LeRobot stats.json (GR00T will regenerate with correct format)${NC}"
+    rm "$DEST_GROOT/meta/stats.json"
+fi
+
 # Convert episodes to jsonl format
 echo -e "${GREEN}Converting episodes to GR00T format...${NC}"
-python "${SCRIPT_DIR}/convert_episodes_to_jsonl.py" "$DEST_DATASET"
+python "${SCRIPT_DIR}/convert_episodes_to_jsonl.py" "$DEST_GROOT"
 
-if [ ! -f "$DEST_DATASET/meta/episodes.jsonl" ]; then
+if [ ! -f "$DEST_GROOT/meta/episodes.jsonl" ]; then
     echo -e "${RED}Failed to create episodes.jsonl${NC}"
     exit 1
 fi
@@ -99,12 +117,12 @@ echo ""
 
 # Convert dataset structure to GR00T format (per-episode files)
 echo -e "${GREEN}Converting dataset structure to GR00T format...${NC}"
-python "${SCRIPT_DIR}/convert_to_groot_format.py" "$DEST_DATASET"
+python "${SCRIPT_DIR}/convert_to_groot_format.py" "$DEST_GROOT"
 echo ""
 
-# Create custom modality.json with scene and wrist cameras
+# Create custom modality.json with front and wrist cameras
 echo -e "${GREEN}Creating custom modality.json...${NC}"
-MODALITY_FILE="${DEST_DATASET}/meta/modality.json"
+MODALITY_FILE="${DEST_GROOT}/meta/modality.json"
 
 cat > "$MODALITY_FILE" << 'EOF'
 {
@@ -129,8 +147,8 @@ cat > "$MODALITY_FILE" << 'EOF'
         }
     },
     "video": {
-        "scene": {
-            "original_key": "observation.images.scene"
+        "front": {
+            "original_key": "observation.images.front"
         },
         "wrist": {
             "original_key": "observation.images.wrist"
@@ -144,7 +162,7 @@ cat > "$MODALITY_FILE" << 'EOF'
 }
 EOF
 
-echo -e "${GREEN}modality.json created with scene and wrist camera keys${NC}"
+echo -e "${GREEN}modality.json created with front and wrist camera keys${NC}"
 echo ""
 
 # Validate modality file
@@ -160,7 +178,7 @@ echo ""
 # Convert videos to H.264 for torchcodec compatibility
 echo -e "${GREEN}Converting videos to H.264 format...${NC}"
 cd "$SCRIPT_DIR"
-python convert_videos_to_h264.py "$DEST_DATASET"
+python convert_videos_to_h264.py "$DEST_GROOT"
 if [ $? -ne 0 ]; then
     echo -e "${RED}Error: Video conversion failed${NC}"
     exit 1
@@ -173,7 +191,7 @@ cd "$ISAAC_GROOT_DIR"
 
 echo "Testing dataset loading..."
 python scripts/load_dataset.py \
-    --dataset-path "demo_data/${DATASET_NAME}" \
+    --dataset-path "${DEST_GROOT}" \
     2>&1 | tee /tmp/dataset_validation.log
 
 if [ ${PIPESTATUS[0]} -eq 0 ]; then
@@ -183,13 +201,13 @@ if [ ${PIPESTATUS[0]} -eq 0 ]; then
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Dataset location:"
-    echo "  ${DEST_DATASET}"
+    echo "  ${DEST_GROOT}"
     echo ""
     echo "Dataset structure:"
-    tree -L 2 "$DEST_DATASET" 2>/dev/null || ls -R "$DEST_DATASET"
+    tree -L 2 "$DEST_GROOT" 2>/dev/null || ls -R "$DEST_GROOT"
     echo ""
     echo -e "${BLUE}Next steps:${NC}"
-    echo "  1. Review dataset: python scripts/load_dataset.py --dataset-path demo_data/${DATASET_NAME} --plot-state-action"
+    echo "  1. Review dataset: python scripts/load_dataset.py --dataset-path ${DEST_GROOT} --plot-state-action"
     echo "  2. Start training: ./03_train_model.sh"
     echo ""
 else

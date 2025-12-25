@@ -13,13 +13,26 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Set DISPLAY for keyboard controls (use native display)
+export DISPLAY=:0
+
 # Configuration
-DATASET_NAME="bread"
-NUM_EPISODES=50
-TASK_DESCRIPTION="Pick slice of bread and place it in the white plate"
+DATASET_NAME="seq1"
+NUM_EPISODES=10
+TASK_DESCRIPTION="Pick slice of first bread and place it in the round plate"
 EPISODE_TIME=30
 RESET_TIME=10
 USE_TELEOPERATION=true  # Set to false if recording without leader arm
+
+# Consolidated ChefMate directory structure
+CHEFMATE_DIR="$HOME/chefmate"
+DATASETS_DIR="${CHEFMATE_DIR}/datasets/lerobot"
+GROOT_DATASETS_DIR="${CHEFMATE_DIR}/datasets/groot_format"
+CHECKPOINTS_DIR="${CHEFMATE_DIR}/checkpoints"
+LOGS_DIR="${CHEFMATE_DIR}/logs"
+
+# Ensure directories exist
+mkdir -p "${DATASETS_DIR}" "${GROOT_DATASETS_DIR}" "${CHECKPOINTS_DIR}" "${LOGS_DIR}"
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}SO-100 GR00T Dataset Recording${NC}"
@@ -145,17 +158,21 @@ echo -e "${GREEN}Starting dataset recording...${NC}"
 echo -e "${YELLOW}Recording ${NUM_EPISODES} episodes...${NC}"
 echo ""
 
-# Record dataset with scene and wrist cameras at 640x480 (smooth recording)
+# Record dataset with front and wrist cameras at 640x480 (smooth recording)
+# Datasets are stored in ~/chefmate/datasets/lerobot/rubbotix/<dataset_name>
+# Note: lerobot expects --dataset.root to be the FULL path including repo_id
+DATASET_FULL_PATH="${DATASETS_DIR}/rubbotix/${DATASET_NAME}"
 lerobot-record \
     --robot.type=so101_follower \
     --robot.port=/dev/follower \
     --robot.id=so101_follower \
-    --robot.cameras="{ wrist: {type: opencv, index_or_path: /dev/wrist, width: 640, height: 480, fps: 30}, scene: {type: opencv, index_or_path: /dev/scene, width: 640, height: 480, fps: 30}}" \
+    --robot.cameras="{ wrist: {type: opencv, index_or_path: /dev/wrist, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: /dev/scene, width: 640, height: 480, fps: 30}}" \
     --teleop.type=so101_leader \
     --teleop.port=/dev/leader \
     --teleop.id=so101_leader \
     --display_data=false \
     --dataset.repo_id="rubbotix/${DATASET_NAME}" \
+    --dataset.root="${DATASET_FULL_PATH}" \
     --dataset.num_episodes="${NUM_EPISODES}" \
     --dataset.single_task="${TASK_DESCRIPTION}" \
     --dataset.push_to_hub=false \
@@ -170,21 +187,20 @@ if [ $? -eq 0 ]; then
     echo -e "${GREEN}========================================${NC}"
     echo ""
     
-    # Dataset location
-    DATASET_PATH="$HOME/.cache/huggingface/lerobot/rubbotix/${DATASET_NAME}"
+    # Dataset location (consolidated in ~/chefmate/datasets/lerobot/)
     echo "Dataset saved to:"
-    echo "  ${DATASET_PATH}"
+    echo "  ${DATASET_FULL_PATH}"
     echo ""
     
     # Show dataset info
-    if [ -d "$DATASET_PATH" ]; then
+    if [ -d "$DATASET_FULL_PATH" ]; then
         echo "Dataset structure:"
-        tree -L 2 "$DATASET_PATH" 2>/dev/null || ls -R "$DATASET_PATH"
+        tree -L 2 "$DATASET_FULL_PATH" 2>/dev/null || ls -R "$DATASET_FULL_PATH"
         echo ""
-        
+
         # Count episodes
-        if [ -d "$DATASET_PATH/videos/chunk-000" ]; then
-            EPISODE_COUNT=$(ls -1 "$DATASET_PATH/videos/chunk-000" | wc -l)
+        if [ -d "$DATASET_FULL_PATH/videos/chunk-000" ]; then
+            EPISODE_COUNT=$(ls -1 "$DATASET_FULL_PATH/videos/chunk-000" | wc -l)
             echo "Episodes recorded: ${EPISODE_COUNT}"
         fi
     fi

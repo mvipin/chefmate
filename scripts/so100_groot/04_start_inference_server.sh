@@ -14,12 +14,15 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Consolidated ChefMate directory structure
+CHEFMATE_DIR="$HOME/chefmate"
+CHECKPOINTS_DIR="${CHEFMATE_DIR}/checkpoints"
+ISAAC_GROOT_DIR="$HOME/Isaac-GR00T"
+
 # Configuration
-DATASET_NAME="cheese_bread_multitask"
-#DATASET_NAME="cheese"
-CHECKPOINT_DIR="$HOME/so100-groot-checkpoints/${DATASET_NAME}"
-#CHECKPOINT_STEP="${1:-3000}"  # Default to step 3000 (latest checkpoint)
-CHECKPOINT_STEP="${1:-10000}"  # Default to step 3000 (latest checkpoint)
+DATASET_NAME="seq"
+CHECKPOINT_DIR="${CHECKPOINTS_DIR}/${DATASET_NAME}"
+CHECKPOINT_STEP="${1:-10000}"  # Default to step 10000
 PORT=8000
 
 echo -e "${GREEN}========================================${NC}"
@@ -84,7 +87,7 @@ nvidia-smi --query-gpu=name,memory.free --format=csv,noheader
 echo ""
 
 # Change to Isaac-GR00T directory
-cd "$HOME/Isaac-GR00T"
+cd "$ISAAC_GROOT_DIR"
 
 # Display server info
 echo -e "${YELLOW}========================================${NC}"

@@ -13,11 +13,21 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Consolidated ChefMate directory structure
+CHEFMATE_DIR="$HOME/chefmate"
+GROOT_DATASETS_DIR="${CHEFMATE_DIR}/datasets/groot_format"
+CHECKPOINTS_DIR="${CHEFMATE_DIR}/checkpoints"
+LOGS_DIR="${CHEFMATE_DIR}/logs/training"
+ISAAC_GROOT_DIR="$HOME/Isaac-GR00T"
+
+# Ensure directories exist
+mkdir -p "${CHECKPOINTS_DIR}" "${LOGS_DIR}"
+
 # Configuration for Multi-Task Training (Cheese + Bread)
 # Using LeRobotMixtureDataset for automatic balancing
 # Training from scratch on both datasets together
-DATASET_NAMES=("cheese" "bread")  # Multiple datasets
-OUTPUT_DIR="$HOME/so100-groot-checkpoints/cheese_bread_multitask"
+DATASET_NAMES=("seq1" "seq2" "seq3")  # Multiple datasets
+OUTPUT_DIR="${CHECKPOINTS_DIR}/seq"
 BATCH_SIZE=16
 GRADIENT_ACCUMULATION_STEPS=8
 MAX_STEPS=10000  # Full training on combined dataset
@@ -29,7 +39,7 @@ LORA_DROPOUT=0.1
 DATALOADER_NUM_WORKERS=8
 
 # Resume from checkpoint (set to "true" to resume from latest checkpoint in output dir)
-RESUME_TRAINING="false"  # Set to "false" to start fresh, "true" to resume from latest checkpoint
+RESUME_TRAINING="true"  # Set to "false" to start fresh, "true" to resume from latest checkpoint
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}SO-100 GR00T Multi-Task Training${NC}"
@@ -59,16 +69,16 @@ echo -e "${GREEN}Activating gr00t environment...${NC}"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gr00t
 
-# Check datasets exist
+# Check datasets exist (now in ~/chefmate/datasets/groot_format/)
 echo -e "${GREEN}Checking datasets...${NC}"
 for DATASET_NAME in "${DATASET_NAMES[@]}"; do
-    DATASET_PATH="$HOME/Isaac-GR00T/demo_data/${DATASET_NAME}"
+    DATASET_PATH="${GROOT_DATASETS_DIR}/${DATASET_NAME}"
     if [ ! -d "$DATASET_PATH" ]; then
         echo -e "${RED}Error: Dataset not found at ${DATASET_PATH}${NC}"
         echo "Please run 02_prepare_dataset.sh first"
         exit 1
     fi
-    echo -e "  ✓ ${DATASET_NAME} found"
+    echo -e "  ✓ ${DATASET_NAME} found at ${DATASET_PATH}"
 done
 echo ""
 
@@ -87,7 +97,7 @@ echo -e "${GREEN}Creating output directory...${NC}"
 mkdir -p "$OUTPUT_DIR"
 
 # Change to Isaac-GR00T directory
-cd "$HOME/Isaac-GR00T"
+cd "$ISAAC_GROOT_DIR"
 
 # Display training info
 echo -e "${YELLOW}========================================${NC}"
@@ -99,13 +109,7 @@ echo "Training from scratch on combined cheese + bread dataset"
 echo "Total episodes: 100 (50 cheese + 50 bread)"
 echo ""
 echo "Estimated training time: ~3-4 hours for 10000 steps"
-echo "Expected VRAM usage: ~7-8GB (with LLM + Vision fine-tuning)"
-echo "Training speed: ~2.8 iterations/second"
-echo ""
-echo -e "${GREEN}⚠️  LANGUAGE CONDITIONING ENABLED:${NC}"
-echo "  - LLM fine-tuning: ✅ Enabled (learns task-specific language)"
-echo "  - Vision fine-tuning: ✅ Enabled (learns visual object recognition)"
-echo "  - This configuration enables proper multitask language conditioning"
+echo "Expected VRAM usage: ~12-14GB"
 echo ""
 echo "Monitor GPU usage in another terminal with:"
 echo "  watch -n 1 nvidia-smi"
@@ -129,10 +133,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONWARNINGS="ignore::UserWarning"
 export TF_CPP_MIN_LOG_LEVEL=2
 
-# Build dataset paths for multi-task training
+# Build dataset paths for multi-task training (using consolidated ~/chefmate/datasets/groot_format/)
 DATASET_PATHS=""
 for DATASET_NAME in "${DATASET_NAMES[@]}"; do
-    DATASET_PATHS="$DATASET_PATHS ./demo_data/${DATASET_NAME}/"
+    DATASET_PATHS="$DATASET_PATHS ${GROOT_DATASETS_DIR}/${DATASET_NAME}/"
 done
 
 # Build training command for multi-task training
@@ -149,11 +153,10 @@ TRAIN_CMD="python scripts/gr00t_finetune.py \
     --save-steps ${SAVE_STEPS} \
     --learning-rate ${LEARNING_RATE} \
     --report-to tensorboard \
+    --no-tune_diffusion_model \
     --lora-rank ${LORA_RANK} \
     --lora-alpha ${LORA_ALPHA} \
     --lora-dropout ${LORA_DROPOUT} \
-    --tune-llm \
-    --tune-visual \
     --balance-dataset-weights \
     --balance-trajectory-weights"
 
